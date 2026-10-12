@@ -13,11 +13,21 @@
           <t-input :placeholder="$t('common.placeholder')" v-model="formData.rule_base.rule_name" />
         </t-form-item>
         <t-form-item :label="$t('page.rule.detail.rule_domain_code')" name="rule_domain_code">
-          <t-select v-model="formData.rule_base.rule_domain_code" clearable filterable :style="{ width: '480px' }">
+          <t-select
+            v-model="selectedHostCodes"
+            multiple
+            clearable
+            filterable
+            :style="{ width: '480px' }"
+            :placeholder="$t('page.rule.detail.rule_domain_code_placeholder')"
+          >
             <t-option v-for="(item, index) in host_options" :value="item.value" :label="item.label" :key="index">
               {{ item.label }}
             </t-option>
           </t-select>
+          <div class="form-item-tips">
+            <div>{{ $t('page.rule.detail.rule_domain_code_multi_tips') }}</div>
+          </div>
         </t-form-item>
         <t-form-item :label="$t('page.rule.detail.rule_salience')" name="salience">
           <t-input :placeholder="$t('common.placeholder')" v-model="formData.rule_base.salience" />
@@ -653,6 +663,9 @@ export default {
       formCodemirrorContent: '',//代码传入值
       //主机列表
       host_options: [],
+      //多选的目标网站（真正的绑定值）；formData.rule_base.rule_domain_code 只保留第一个，
+      //用于兼容后端 rule_json 里的单站点字段、AI生成与规则测试等老逻辑
+      selectedHostCodes: [],
       //uuid标识
       ruleuuid: "",
       //来源日志的字符串
@@ -745,6 +758,7 @@ export default {
         this.formData.is_manual_rule = this.$route.query.is_manual_rule
         this.fromLogContentStr = this.$route.query.contentstr
         this.formData.rule_base.rule_domain_code = this.$route.query.host_code
+        this.selectedHostCodes = this.$route.query.host_code ? [this.$route.query.host_code] : []
         this.fromSourcePoint = this.$route.query.sourcePoint
         this.setRuleContentByMode()
       } else if (this.op_type == "add" && this.$route.query.sourcePoint == undefined) {
@@ -771,6 +785,12 @@ export default {
     console.log('----updated----')
   },
   watch: {
+    //多选网站变化时把首个站点同步到 rule_base：
+    //rule_json 里的 rule_domain_code 仍是单值字段，AI生成、规则测试等老逻辑只认它
+    selectedHostCodes(newVal) {
+      const primary = (newVal && newVal.length > 0) ? newVal[0] : '请选择网站'
+      this.formData.rule_base.rule_domain_code = primary
+    },
     '$route.query.type'(newVal, oldVal) {
       console.log('route.query.type changed', newVal, oldVal)
       this.op_type = newVal
@@ -793,6 +813,8 @@ export default {
       this.formData = {
         ...copyObj(RULE)
       }
+      // 多选网站也要一起清空
+      this.selectedHostCodes = []
       console.log("重置表单数据 after", this.formData)
 
       console.log("重置表单数据 rule", RULE)
@@ -835,6 +857,14 @@ export default {
 
             that.formData = JSON.parse(resdata.data.rule_content_json);
             that.formData.rule_status = resdata.data.rule_status
+            //还原这条规则覆盖的网站：多站点规则以接口返回的批次站点为准，
+            //rule_content_json 里存的可能还是老的单站点值
+            let batchHostCodes = resdata.data.batch_host_codes
+            if (!batchHostCodes || batchHostCodes.length === 0) {
+              batchHostCodes = resdata.data.host_code ? [resdata.data.host_code] : []
+            }
+            that.selectedHostCodes = batchHostCodes.slice()
+            that.formData.rule_base.rule_domain_code = batchHostCodes.length > 0 ? batchHostCodes[0] : '请选择网站'
             //老规则没有动作字段，补默认值（拦截），保证界面正常显示且行为不变
             if (!that.formData.rule_action) {
               that.$set(that.formData, 'rule_action', 'deny')
@@ -855,6 +885,11 @@ export default {
     onSubmit({ result, firstError }): void {
       let that = this
       if (!firstError) {
+        //网站是多选，至少要选一个；后端也会再校验一遍
+        if (!that.selectedHostCodes || that.selectedHostCodes.length === 0) {
+          that.$message.warning(that.$t('page.rule.detail.rule_domain_code_required'))
+          return
+        }
         let postdata = {}
         let url = ''
         if (that.op_type == "add") {
@@ -871,7 +906,8 @@ export default {
             is_manual_rule: parseInt(that.formData.is_manual_rule),
             rule_content: that.formCodemirrorContent,
             rule_code: that.ruleuuid,
-            rule_status: that.formData.rule_status
+            rule_status: that.formData.rule_status,
+            host_codes: that.selectedHostCodes
           }
           console.log("rule add postdata",postdata);
 
@@ -910,7 +946,8 @@ export default {
             rule_json: JSON.stringify(that.formData),
             is_manual_rule: parseInt(that.formData.is_manual_rule),
             rule_content: that.formCodemirrorContent,
-            rule_status: that.formData.rule_status
+            rule_status: that.formData.rule_status,
+            host_codes: that.selectedHostCodes
           }
           console.log("formCodemirrorContent", that.formCodemirrorContent)
           console.log('edit postdata', postdata)

@@ -4569,6 +4569,8 @@ export default {
       clear_all_success: "Clear all successful",
       no_data_selected: "Please select data to delete first",
       no_website_selected: "Please select a website first",
+      multi_host_tag: "Multi-site {count}",
+      confirm_delete_multi: "This rule applies to {count} websites. Deleting removes it from all of them. Continue?",
       chain_mode: {
         entry: "Rule Chain Mode",
         title: "Rule Chain Mode Settings",
@@ -4588,6 +4590,9 @@ export default {
         base_info: "Basic Information",
         rule_name: "Rule Name",
         rule_domain_code: "Protected Website",
+        rule_domain_code_placeholder: "Select website(s), multi-select supported",
+        rule_domain_code_multi_tips: "Multi-select supported: each selected website gets its own copy of this rule; later edits or deletions sync the whole group.",
+        rule_domain_code_required: "Please select at least one website",
         rule_salience: "Rule Priority",
         rule_salience_tips_1: "Higher wins. Range 0-10000, default 10.",
         rule_salience_tips_2: "Site rules and global rules are arbitrated together by priority: the higher value wins; on a tie the order is deny > allow > log (so on a tie, a global deny overrides a site allow). To make a site whitelist override a global blocking rule, set this value higher than the global rule's.",

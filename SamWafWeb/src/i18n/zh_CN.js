@@ -4572,6 +4572,8 @@ export default {
       clear_all_success: "清空所有成功",
       no_data_selected: "请先选择要删除的数据",
       no_website_selected: "请先选择网站",
+      multi_host_tag: "多站点 {count}",
+      confirm_delete_multi: "该规则同时应用于 {count} 个网站，删除会一并移除，是否继续？",
       chain_mode: {
         entry: "规则编排模式",
         title: "规则编排模式设置",
@@ -4591,6 +4593,9 @@ export default {
         base_info: "基本信息",
         rule_name: "规则名称",
         rule_domain_code: "防护网站",
+        rule_domain_code_placeholder: "请选择网站，可多选",
+        rule_domain_code_multi_tips: "支持多选：每个选中的网站都会各生成一条规则；之后编辑或删除这条规则会同步整组站点。",
+        rule_domain_code_required: "请至少选择一个网站",
         rule_salience: "规则优先级",
         rule_salience_tips_1: "数值越大越优先，范围 0~10000，默认 10。",
         rule_salience_tips_2: "站点规则和全局规则会放在一起按优先级仲裁：数值大的一方胜出；数值相同时按 拦截 > 放行 > 仅记录 取（同优先级时全局拦截会盖住站点放行）。所以站点白名单要压过全局拦截规则，必须把这里的数值调得比全局规则更大。",

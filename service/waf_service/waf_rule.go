@@ -11,6 +11,8 @@ import (
 	"SamWaf/utils"
 	"errors"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type WafRuleService struct{}
@@ -18,13 +20,25 @@ type WafRuleService struct{}
 var WafRuleServiceApp = new(WafRuleService)
 
 func (receiver *WafRuleService) AddApi(wafRuleAddReq request.WafRuleAddReq, ruleCode string, chsName string, hostCode string, ruleContent string) error {
+	return receiver.AddRuleApi(wafRuleAddReq, ruleCode, chsName, hostCode, ruleContent, "")
+}
+
+// AddRuleApi 落一条规则记录。
+//batchCode 非空表示这条记录属于一次「多选网站」提交的同一批次：
+//引擎依旧按 host_code 逐站点加载，所以每个站点各存一条，批次码只用于把它们串成一组。
+func (receiver *WafRuleService) AddRuleApi(wafRuleAddReq request.WafRuleAddReq, ruleCode string, chsName string, hostCode string, ruleContent string, batchCode string) error {
+	return global.GWAF_LOCAL_DB.Create(receiver.BuildRuleBean(wafRuleAddReq, ruleCode, chsName, hostCode, ruleContent, batchCode)).Error
+}
+
+// BuildRuleBean 组装一条规则记录（只组装不落库），供单条新增与多站点批量新增共用
+func (receiver *WafRuleService) BuildRuleBean(wafRuleAddReq request.WafRuleAddReq, ruleCode string, chsName string, hostCode string, ruleContent string, batchCode string) *model.Rules {
 	// 如果没有传入规则状态，默认为开启（1）
 	ruleStatus := wafRuleAddReq.RuleStatus
 	if ruleStatus != 0 && ruleStatus != 1 {
 		ruleStatus = 1
 	}
 
-	var wafRule = &model.Rules{
+	return &model.Rules{
 		BaseOrm: baseorm.BaseOrm{
 			Id:          uuid.GenUUID(),
 			USER_CODE:   global.GWAF_USER_CODE,
@@ -42,9 +56,166 @@ func (receiver *WafRuleService) AddApi(wafRuleAddReq request.WafRuleAddReq, rule
 		IsPublicRule:    0,
 		IsManualRule:    wafRuleAddReq.IsManualRule,
 		RuleStatus:      ruleStatus,
+		BatchCode:       batchCode,
 	}
-	global.GWAF_LOCAL_DB.Create(wafRule)
-	return nil
+}
+
+// AddRulesApi 一次落多条规则记录（多站点一次提交），放在同一个事务里保证要么全成要么全不成，
+//避免中途失败留下"只加了一半站点"的规则。
+func (receiver *WafRuleService) AddRulesApi(rules []*model.Rules) error {
+	if len(rules) == 0 {
+		return errors.New("规则内容为空")
+	}
+	return global.GWAF_LOCAL_DB.Transaction(func(tx *gorm.DB) error {
+		for _, rule := range rules {
+			if err := tx.Create(rule).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// SetBatchCodeApi 给一组规则打上同一个批次码（编辑时把原本独立的规则扩成多站点规则）
+func (receiver *WafRuleService) SetBatchCodeApi(ruleCodes []string, batchCode string) error {
+	if len(ruleCodes) == 0 || batchCode == "" {
+		return nil
+	}
+	return global.GWAF_LOCAL_DB.Model(model.Rules{}).Where("rule_code IN ?", ruleCodes).
+		Updates(map[string]interface{}{
+			"BatchCode":  batchCode,
+			"UPDATE_TIME": customtype.JsonTime(time.Now()),
+		}).Error
+}
+
+// GetRulesByBatchCode 取同一批次下的全部有效规则，按创建时间排序保证顺序稳定
+func (receiver *WafRuleService) GetRulesByBatchCode(batchCode string) []model.Rules {
+	var rules []model.Rules
+	if batchCode == "" {
+		return rules
+	}
+	global.GWAF_LOCAL_DB.Where("batch_code = ? and rule_status <> 999", batchCode).
+		Order("create_time asc").Find(&rules)
+	return rules
+}
+
+// ExpandBatchCodes 把传入的规则码扩展为「这些规则所属批次的全部规则码」。
+// 多站点规则是按网站拆成多行的，删掉/停用其中任意一行都要带上同批次的其他行，
+// 否则会留下只认自己一个站点的半条规则。批量删除、切换状态都走这里。
+func (receiver *WafRuleService) ExpandBatchCodes(ruleCodes []string) []string {
+	if len(ruleCodes) == 0 {
+		return ruleCodes
+	}
+	var rules []model.Rules
+	global.GWAF_LOCAL_DB.Where("rule_code IN ?", ruleCodes).Find(&rules)
+
+	allCodes := map[string]bool{}
+	for _, ruleCode := range ruleCodes {
+		allCodes[ruleCode] = true
+	}
+	var batchCodes []string
+	seen := map[string]bool{}
+	for i := range rules {
+		if rules[i].BatchCode == "" || seen[rules[i].BatchCode] {
+			continue
+		}
+		seen[rules[i].BatchCode] = true
+		batchCodes = append(batchCodes, rules[i].BatchCode)
+	}
+	if len(batchCodes) == 0 {
+		return ruleCodes
+	}
+
+	var siblings []model.Rules
+	global.GWAF_LOCAL_DB.Where("batch_code IN ? and rule_status <> 999", batchCodes).Find(&siblings)
+	for i := range siblings {
+		allCodes[siblings[i].RuleCode] = true
+	}
+
+	result := make([]string, 0, len(allCodes))
+	for ruleCode := range allCodes {
+		result = append(result, ruleCode)
+	}
+	return result
+}
+
+// DelRuleCodes 按规则码软删除（批次编辑时用于剔除被取消的站点）
+func (receiver *WafRuleService) DelRuleCodes(ruleCodes []string) error {
+	if len(ruleCodes) == 0 {
+		return nil
+	}
+	ruleMap := map[string]interface{}{
+		"RuleStatus":  "999",
+		"RuleVersion": 999999,
+		"UPDATE_TIME": customtype.JsonTime(time.Now()),
+	}
+	return global.GWAF_LOCAL_DB.Model(model.Rules{}).Where("rule_code IN ?", ruleCodes).Updates(ruleMap).Error
+}
+
+// UpdateRuleApi 按规则码更新单条规则，用于多站点批次的逐条同步
+func (receiver *WafRuleService) UpdateRuleApi(ruleCode string, chsName string, hostCode string, ruleContent string, ruleContentJSON string, isManualRule int, ruleStatus int) error {
+	var rule model.Rules
+	global.GWAF_LOCAL_DB.Where("rule_code=?", ruleCode).Find(&rule)
+	if rule.Id == "" {
+		return errors.New("要更新的规则不存在")
+	}
+	if ruleStatus != 0 && ruleStatus != 1 {
+		ruleStatus = rule.RuleStatus
+	}
+	ruleMap := map[string]interface{}{
+		"HostCode":        hostCode,
+		"RuleName":        chsName,
+		"RuleContent":     ruleContent,
+		"RuleContentJSON": ruleContentJSON,
+		"RuleVersionName": "初版",
+		"RuleVersion":     rule.RuleVersion + 1,
+		"user_code":       global.GWAF_USER_CODE,
+		"IsPublicRule":    0,
+		"IsManualRule":    isManualRule,
+		"RuleStatus":      ruleStatus,
+		"UPDATE_TIME":     customtype.JsonTime(time.Now()),
+	}
+	return global.GWAF_LOCAL_DB.Model(model.Rules{}).Where("rule_code=?", ruleCode).Updates(ruleMap).Error
+}
+
+// FillBatchInfo 给规则列表补上批次信息（本批次覆盖了哪些站点、共几条），供前端把一组规则
+//当作一条规则展示与编辑。用一次 IN 查询补齐所有规则，避免逐条查询造成 N+1。
+func (receiver *WafRuleService) FillBatchInfo(rules []model.Rules) []model.Rules {
+	if len(rules) == 0 {
+		return rules
+	}
+	batchSeen := map[string]bool{}
+	var batchCodes []string
+	for i := range rules {
+		bc := rules[i].BatchCode
+		if bc != "" && !batchSeen[bc] {
+			batchSeen[bc] = true
+			batchCodes = append(batchCodes, bc)
+		}
+	}
+	hostMap := map[string][]string{}
+	if len(batchCodes) > 0 {
+		var siblings []model.Rules
+		global.GWAF_LOCAL_DB.Model(&model.Rules{}).
+			Select("batch_code", "host_code").
+			Where("batch_code IN ? and rule_status <> 999", batchCodes).
+			Order("create_time asc").Find(&siblings)
+		for _, s := range siblings {
+			hostMap[s.BatchCode] = append(hostMap[s.BatchCode], s.HostCode)
+		}
+	}
+	for i := range rules {
+		hosts := hostMap[rules[i].BatchCode]
+		if len(hosts) == 0 {
+			//独立规则（含历史数据）：批次信息回退为自己的站点，前端逻辑可统一处理
+			rules[i].BatchHostCodes = []string{rules[i].HostCode}
+			rules[i].BatchSize = 1
+			continue
+		}
+		rules[i].BatchHostCodes = hosts
+		rules[i].BatchSize = len(hosts)
+	}
+	return rules
 }
 
 /*
@@ -275,6 +446,7 @@ func (receiver *WafRuleService) ModifyRuleStatusApi(req request.WafRuleStatusReq
 		"UPDATE_TIME": customtype.JsonTime(time.Now()),
 	}
 
-	err := global.GWAF_LOCAL_DB.Model(model.Rules{}).Where("rule_code=?", req.CODE).Updates(ruleMap).Error
-	return err
+	//多站点规则整组一起改，避免同一条规则在部分站点生效、部分站点不生效
+	ruleCodes := receiver.ExpandBatchCodes([]string{req.CODE})
+	return global.GWAF_LOCAL_DB.Model(model.Rules{}).Where("rule_code IN ?", ruleCodes).Updates(ruleMap).Error
 }

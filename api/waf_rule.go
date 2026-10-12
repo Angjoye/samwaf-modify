@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 type WafRuleAPi struct {
@@ -61,6 +60,63 @@ func checkManualRuleContent(ruleHelper *utils.RuleHelper, ruleContent string, ex
 	return nil
 }
 
+// ruleBatchMaxHosts 一次多选网站的站点数上限，挡住"误选全部站点"把规则表撑爆
+const ruleBatchMaxHosts = 200
+
+// resolveRuleHostCodes 归一化前端传来的目标站点列表：
+//去空、去重、剔除占位文案，并在为空时回退到规则JSON里的单站点，保证老前端与老接口调用方行为不变。
+func resolveRuleHostCodes(reqHostCodes []string, fallback string) ([]string, error) {
+	seen := map[string]bool{}
+	hosts := make([]string, 0, len(reqHostCodes))
+	for _, h := range reqHostCodes {
+		h = strings.TrimSpace(h)
+		if h == "" || h == "请选择网站" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		hosts = append(hosts, h)
+	}
+	if len(hosts) == 0 {
+		fb := strings.TrimSpace(fallback)
+		if fb == "" || fb == "请选择网站" {
+			return nil, errors.New("请选择网站")
+		}
+		hosts = append(hosts, fb)
+	}
+	if len(hosts) > ruleBatchMaxHosts {
+		return nil, fmt.Errorf("一次最多选择 %d 个网站", ruleBatchMaxHosts)
+	}
+	return hosts, nil
+}
+
+// rewriteManualRuleName 把手工规则文本里的规则名换成目标规则码对应的名字。
+//多站点扇出时每个站点必须有各自唯一的规则名，否则规则之间会互相覆盖。
+func rewriteManualRuleName(ruleContent string, oldName string, newRuleCode string) string {
+	oldName = strings.TrimSpace(oldName)
+	if oldName == "" {
+		return ruleContent
+	}
+	newName := strings.Replace(newRuleCode, "-", "", -1)
+	if oldName == newName {
+		return ruleContent
+	}
+	return strings.Replace(ruleContent, "R"+oldName, "R"+newName, 1)
+}
+
+// uniqueHostCodes 保序去重，通知引擎时避免同一个站点被重复推送
+func uniqueHostCodes(hostCodes []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(hostCodes))
+	for _, h := range hostCodes {
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		result = append(result, h)
+	}
+	return result
+}
+
 // AddApi 新增WAF规则
 // @Summary      新增WAF规则
 // @Description  新增一条WAF防护规则
@@ -75,75 +131,97 @@ func (w *WafRuleAPi) AddApi(c *gin.Context) {
 	ruleHelper := &utils.RuleHelper{}
 	var req request.WafRuleAddReq
 	err := c.ShouldBindJSON(&req)
-	if err == nil {
-		var ruleTool = model.RuleTool{}
-		ruleInfo, err := ruleTool.LoadRule(req.RuleJson)
-		if err != nil {
-			response.FailWithMessage("规则解析错误", c)
-			return
-		}
-		var ruleCode = uuid.GenUUID()
-		if req.IsManualRule == 1 {
-			ruleCodeFormDRL, err := ruleHelper.ExtractRuleName(req.RuleJson)
-			if err != nil {
-				response.FailWithMessage(err.Error(), c)
-			}
-			if ruleCodeFormDRL != "{SamWafUUID}" {
-				ruleCode = ruleCodeFormDRL
-			}
-		} else {
-			//手工编码情况下 前端准备好的
-			ruleCode = req.RuleCode
-		}
-		if ruleInfo.RuleBase.RuleDomainCode == "请选择网站" {
-			response.FailWithMessage("请选择网站", c)
-			return
-		}
-		count := wafRuleService.CheckIsExistApi(ruleInfo.RuleBase.RuleName, ruleInfo.RuleBase.RuleDomainCode)
-		if count > 0 {
-			response.FailWithMessage("当前规则已存在", c)
-			return
-		}
-		chsName := ruleInfo.RuleBase.RuleName
+	if err != nil {
+		response.FailWithMessage("解析失败", c)
+		return
+	}
 
-		if req.IsManualRule == 1 {
-			existBean := wafRuleService.GetDetailByCodeApi(ruleCode)
+	var ruleTool = model.RuleTool{}
+	ruleInfo, err := ruleTool.LoadRule(req.RuleJson)
+	if err != nil {
+		response.FailWithMessage("规则解析错误", c)
+		return
+	}
+
+	//目标站点：优先取多选结果（host_codes），为空时回退到规则JSON里的单站点，兼容老前端
+	hostCodes, err := resolveRuleHostCodes(req.HostCodes, ruleInfo.RuleBase.RuleDomainCode)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	chsName := ruleInfo.RuleBase.RuleName
+
+	//基准规则码：界面模式用前端准备好的；手工模式的规则码写在规则文本里，从中提取
+	baseRuleCode := uuid.GenUUID()
+	manualRuleName := ""
+	if req.IsManualRule == 1 {
+		manualRuleName, err = ruleHelper.ExtractRuleName(req.RuleJson)
+		if err != nil {
+			response.FailWithMessage(err.Error(), c)
+			return
+		}
+		if manualRuleName != "{SamWafUUID}" {
+			baseRuleCode = manualRuleName
+			existBean := wafRuleService.GetDetailByCodeApi(baseRuleCode)
 			if existBean.RuleCode != "" {
 				response.FailWithMessage("当前编码已存在，请刷新页面重新尝试", c)
 				return
 			}
 		}
-		ruleInfo.RuleBase.RuleName = strings.Replace(ruleCode, "-", "", -1)
+	} else if strings.TrimSpace(req.RuleCode) != "" {
+		//手工编码情况下 前端准备好的
+		baseRuleCode = req.RuleCode
+	}
 
+	//先做完整校验再落库：任一站点不通过就整批拒绝，避免出现"只加了一半站点"
+	for _, hostCode := range hostCodes {
+		if count := wafRuleService.CheckIsExistApi(chsName, hostCode); count > 0 {
+			response.FailWithMessage("当前规则已存在", c)
+			return
+		}
+	}
+
+	//多站点规则：每个站点各存一条记录并共享同一个批次码。
+	//引擎依旧按 host_code 逐站点加载，所以这里不需要改引擎，站点之间的规则天然互不影响。
+	batchCode := uuid.GenUUID()
+	beans := make([]*model.Rules, 0, len(hostCodes))
+	for i, hostCode := range hostCodes {
+		ruleCode := baseRuleCode
+		if i > 0 {
+			//一个规则码不能挂在两条记录上，第二个站点起各自生成
+			ruleCode = uuid.GenUUID()
+		}
 		var ruleContent string
 		if req.IsManualRule == 1 {
-			ruleContent = ruleInfo.RuleContent
-			//检查规则是否合法
+			//手工模式的规则名必须和规则码一致，逐站点改写规则名
+			ruleContent = rewriteManualRuleName(ruleInfo.RuleContent, manualRuleName, ruleCode)
 			if err = checkManualRuleContent(ruleHelper, ruleContent, ruleCode); err != nil {
 				response.FailWithMessage(err.Error(), c)
 				return
 			}
 		} else {
+			ruleInfo.RuleBase.RuleName = strings.Replace(ruleCode, "-", "", -1)
 			ruleContent, err = ruleTool.GenRuleInfo(ruleInfo, chsName)
 			if err != nil {
 				response.FailWithMessage(err.Error(), c)
 				return
 			}
 		}
+		beans = append(beans, wafRuleService.BuildRuleBean(req, ruleCode, chsName, hostCode, ruleContent, batchCode))
+	}
 
-		err = wafRuleService.AddApi(req, ruleCode, chsName, ruleInfo.RuleBase.RuleDomainCode, ruleContent)
-		if err == nil {
-			w.NotifyWaf(ruleInfo.RuleBase.RuleDomainCode)
-			response.OkWithMessage("添加成功", c)
-			return
-		} else {
-
-			response.FailWithMessage("添加失败", c)
-			return
-		}
-	} else {
-		response.FailWithMessage("解析失败", c)
+	if err = wafRuleService.AddRulesApi(beans); err != nil {
+		response.FailWithMessage("添加失败", c)
 		return
+	}
+	for _, hostCode := range uniqueHostCodes(hostCodes) {
+		w.NotifyWaf(hostCode)
+	}
+	if len(hostCodes) > 1 {
+		response.OkWithMessage(fmt.Sprintf("添加成功，已应用到 %d 个网站", len(hostCodes)), c)
+	} else {
+		response.OkWithMessage("添加成功", c)
 	}
 }
 
@@ -162,6 +240,11 @@ func (w *WafRuleAPi) GetDetailApi(c *gin.Context) {
 	err := c.ShouldBind(&req)
 	if err == nil {
 		wafHost := wafRuleService.GetDetailApi(req)
+		//回显该规则所在批次的全部站点，前端据此把"多选网站"还原出来便于继续编辑
+		filled := wafRuleService.FillBatchInfo([]model.Rules{wafHost})
+		if len(filled) > 0 {
+			wafHost = filled[0]
+		}
 		response.OkWithDetailed(wafHost, "获取成功", c)
 	} else {
 		response.FailWithMessage("解析失败", c)
@@ -183,6 +266,8 @@ func (w *WafRuleAPi) GetListApi(c *gin.Context) {
 	err := c.ShouldBindJSON(&req)
 	if err == nil {
 		wafRules, total, _ := wafRuleService.GetListApi(req)
+		//补上批次信息，列表里能看出哪些规则是"一条规则套多个网站"（一次 IN 查询，无 N+1）
+		wafRules = wafRuleService.FillBatchInfo(wafRules)
 		response.OkWithDetailed(response.PageResult{
 			List:      wafRules,
 			Total:     total,
@@ -199,6 +284,7 @@ func (w *WafRuleAPi) GetListByHostCodeApi(c *gin.Context) {
 	err := c.ShouldBind(&req)
 	if err == nil {
 		wafRules, total, _ := wafRuleService.GetListByHostCodeApi(req)
+		wafRules = wafRuleService.FillBatchInfo(wafRules)
 		response.OkWithDetailed(response.PageResult{
 			List:      wafRules,
 			Total:     total,
@@ -223,22 +309,45 @@ func (w *WafRuleAPi) GetListByHostCodeApi(c *gin.Context) {
 func (w *WafRuleAPi) DelRuleApi(c *gin.Context) {
 	var req request.WafRuleDelReq
 	err := c.ShouldBind(&req)
-	if err == nil {
-		wafRule := wafRuleService.GetDetailByCodeApi(req.CODE)
-		err = wafRuleService.DelRuleApi(req)
-		//TODO 通知引擎重新加载某个网站的规则信息
-		if err != nil && errors.Is(err, gorm.ErrRecordNotFound) {
-			response.FailWithMessage("请检测参数", c)
-			return
-		} else if err != nil {
-			response.FailWithMessage("发生错误", c)
-		} else {
-			w.NotifyWaf(wafRule.HostCode)
-			response.OkWithMessage("删除成功", c)
-		}
-
-	} else {
+	if err != nil {
 		response.FailWithMessage("解析失败", c)
+		return
+	}
+
+	wafRule := wafRuleService.GetDetailByCodeApi(req.CODE)
+	if wafRule.Id == "" {
+		response.FailWithMessage("请检测参数", c)
+		return
+	}
+
+	//多站点规则删一条即删一组：整批一起清理，避免留下"孤儿"规则继续占着其他站点
+	ruleCodes := []string{wafRule.RuleCode}
+	hostCodes := []string{wafRule.HostCode}
+	if wafRule.BatchCode != "" {
+		siblings := wafRuleService.GetRulesByBatchCode(wafRule.BatchCode)
+		if len(siblings) > 0 {
+			ruleCodes = make([]string, 0, len(siblings))
+			hostCodes = make([]string, 0, len(siblings))
+			for _, sibling := range siblings {
+				ruleCodes = append(ruleCodes, sibling.RuleCode)
+				hostCodes = append(hostCodes, sibling.HostCode)
+			}
+		}
+	}
+
+	err = wafRuleService.DelRuleCodes(ruleCodes)
+	if err != nil {
+		response.FailWithMessage("发生错误", c)
+		return
+	}
+	//TODO 通知引擎重新加载某个网站的规则信息
+	for _, hostCode := range uniqueHostCodes(hostCodes) {
+		w.NotifyWaf(hostCode)
+	}
+	if len(ruleCodes) > 1 {
+		response.OkWithMessage(fmt.Sprintf("删除成功，已从 %d 个网站移除", len(ruleCodes)), c)
+	} else {
+		response.OkWithMessage("删除成功", c)
 	}
 }
 
@@ -256,58 +365,191 @@ func (w *WafRuleAPi) ModifyRuleApi(c *gin.Context) {
 	ruleHelper := &utils.RuleHelper{}
 	var req request.WafRuleEditReq
 	err := c.ShouldBindJSON(&req)
-	if err == nil {
-		var ruleTool = model.RuleTool{}
-		rule := wafRuleService.GetDetailByCodeApi(req.CODE)
+	if err != nil {
+		response.FailWithMessage("解析失败", c)
+		return
+	}
 
-		if req.IsManualRule == 1 {
-			ruleCodeFormDRL, err := ruleHelper.ExtractRuleName(req.RuleJson)
-			if err != nil {
-				response.FailWithMessage(err.Error(), c)
-			}
-			if rule.RuleCode != ruleCodeFormDRL {
-				zlog.Debug(fmt.Sprintf("原始的规则码 %v， 需要替换的规则码 %v", rule.RuleCode, ruleCodeFormDRL))
-				beforeJson := req.RuleJson
-				req.RuleJson = strings.Replace(req.RuleJson, ruleCodeFormDRL, strings.Replace(rule.RuleCode, "-", "", -1), -1)
-				zlog.Debug(fmt.Sprintf("原始信息 %v 替换后信息 %v ", beforeJson, req.RuleJson))
+	var ruleTool = model.RuleTool{}
+	rule := wafRuleService.GetDetailByCodeApi(req.CODE)
+	if rule.Id == "" {
+		response.FailWithMessage("请检测参数", c)
+		return
+	}
 
-			}
-		}
-		ruleInfo, err := ruleTool.LoadRule(req.RuleJson)
+	//目标站点集合暂时留到规则JSON解析之后再定：
+	//老前端是单站点，站点写在 rule_json 的 rule_domain_code 里，优先级必须高于库里的当前站点
+	if req.IsManualRule == 1 {
+		ruleCodeFormDRL, err := ruleHelper.ExtractRuleName(req.RuleJson)
 		if err != nil {
-			response.FailWithMessage("解析错误", c)
+			response.FailWithMessage(err.Error(), c)
 			return
 		}
+		if rule.RuleCode != ruleCodeFormDRL {
+			zlog.Debug(fmt.Sprintf("原始的规则码 %v， 需要替换的规则码 %v", rule.RuleCode, ruleCodeFormDRL))
+			beforeJson := req.RuleJson
+			req.RuleJson = strings.Replace(req.RuleJson, ruleCodeFormDRL, strings.Replace(rule.RuleCode, "-", "", -1), -1)
+			zlog.Debug(fmt.Sprintf("原始信息 %v 替换后信息 %v ", beforeJson, req.RuleJson))
 
-		var ruleName = ruleInfo.RuleBase.RuleName //中文名
-		ruleInfo.RuleBase.RuleName = strings.Replace(rule.RuleCode, "-", "", -1)
-		var ruleContent string
+		}
+	}
+	ruleInfo, err := ruleTool.LoadRule(req.RuleJson)
+	if err != nil {
+		response.FailWithMessage("解析错误", c)
+		return
+	}
+
+	//目标站点：优先取多选结果（host_codes）；没有就退回规则JSON里的单站点（老前端），
+	//再没有才用库里这条记录当前的站点
+	fallbackHost := strings.TrimSpace(ruleInfo.RuleBase.RuleDomainCode)
+	if fallbackHost == "" || fallbackHost == "请选择网站" {
+		fallbackHost = rule.HostCode
+	}
+	targetHosts, err := resolveRuleHostCodes(req.HostCodes, fallbackHost)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	var ruleName = ruleInfo.RuleBase.RuleName //中文名
+
+	//批次内已有站点：历史独立规则批次码为空，视为只有它自己
+	siblings := []model.Rules{rule}
+	if rule.BatchCode != "" {
+		if batchRules := wafRuleService.GetRulesByBatchCode(rule.BatchCode); len(batchRules) > 0 {
+			siblings = batchRules
+		}
+	}
+	existing := make(map[string]model.Rules, len(siblings))
+	siblingCodes := make([]string, 0, len(siblings))
+	for _, sibling := range siblings {
+		existing[sibling.HostCode] = sibling
+		siblingCodes = append(siblingCodes, sibling.RuleCode)
+	}
+
+	//单个站点之间搬家时保持原来的规则码（老行为），否则"编辑换个网站"会变成换了一条规则
+	movedRuleCode := ""
+	if len(siblings) == 1 && len(targetHosts) == 1 && siblings[0].HostCode != targetHosts[0] {
+		movedRuleCode = siblings[0].RuleCode
+		existing[targetHosts[0]] = siblings[0]
+	}
+
+	//同名冲突检查：同一站点下不能有两条不同规则重名。
+	//同批次的多站点规则天然同名，必须排除自己和同批次其他站点，否则会误报。
+	var dupCount int64
+	err = global.GWAF_LOCAL_DB.Model(&model.Rules{}).
+		Where("rule_name = ? and host_code IN ? and rule_status <> 999", ruleName, targetHosts).
+		Where("rule_code NOT IN ?", siblingCodes).
+		Count(&dupCount).Error
+	if err != nil {
+		response.FailWithMessage("编辑发生错误", c)
+		return
+	}
+	if dupCount > 0 {
+		response.FailWithMessage("当前规则名称已经存在", c)
+		return
+	}
+
+	//目标超过一个站点才需要批次码；原本独立的规则一旦扩成多站点就补上
+	batchCode := rule.BatchCode
+	if batchCode == "" && len(targetHosts) > 1 {
+		batchCode = uuid.GenUUID()
+	}
+
+	//按目标集合做差异同步：留着的更新内容、新增的插入、取消的软删除
+	keep := make(map[string]bool, len(targetHosts))
+	for _, hostCode := range targetHosts {
+		keep[hostCode] = true
+	}
+	var removeCodes []string
+	for _, sibling := range siblings {
+		if !keep[sibling.HostCode] && sibling.RuleCode != movedRuleCode {
+			removeCodes = append(removeCodes, sibling.RuleCode)
+		}
+	}
+
+	//有效状态沿用旧值，前端没传就保持原样
+	status := req.RuleStatus
+	if status != 0 && status != 1 {
+		status = rule.RuleStatus
+	}
+
+	//手工模式提交内容里的规则名对应本条记录的规则码，同步到别的站点时要逐一改写规则名
+	manualBaseName := ""
+	if req.IsManualRule == 1 {
+		manualBaseName = strings.Replace(rule.RuleCode, "-", "", -1)
+	}
+
+	var addBeans []*model.Rules
+	for _, hostCode := range targetHosts {
+		sibling, ok := existing[hostCode]
+		hostRuleCode := uuid.GenUUID()
+		if ok {
+			hostRuleCode = sibling.RuleCode
+		}
+
+		var hostContent string
 		if req.IsManualRule == 1 {
-			ruleContent = ruleInfo.RuleContent
-			//检查规则是否合法
-			if err = checkManualRuleContent(ruleHelper, ruleContent, rule.RuleCode); err != nil {
+			hostContent = rewriteManualRuleName(ruleInfo.RuleContent, manualBaseName, hostRuleCode)
+			if err = checkManualRuleContent(ruleHelper, hostContent, hostRuleCode); err != nil {
 				response.FailWithMessage(err.Error(), c)
 				return
 			}
 		} else {
-			ruleContent, err = ruleTool.GenRuleInfo(ruleInfo, ruleName)
+			ruleInfo.RuleBase.RuleName = strings.Replace(hostRuleCode, "-", "", -1)
+			hostContent, err = ruleTool.GenRuleInfo(ruleInfo, ruleName)
 			if err != nil {
 				response.FailWithMessage(err.Error(), c)
 				return
 			}
 		}
 
-		err = wafRuleService.ModifyApi(req, ruleName, ruleInfo.RuleBase.RuleDomainCode, ruleContent)
-		if err != nil {
-			response.FailWithMessage("编辑发生错误", c)
+		if ok {
+			if err = wafRuleService.UpdateRuleApi(hostRuleCode, ruleName, hostCode, hostContent, req.RuleJson, req.IsManualRule, status); err != nil {
+				response.FailWithMessage("编辑发生错误", c)
+				return
+			}
 		} else {
-			//rule 是编辑前按 CODE 取出的旧记录，若本次把规则挪到了别的网站，旧网站也要一并刷新(issue #898)
-			notifyWafHostChanged(w.NotifyWaf, rule.HostCode, ruleInfo.RuleBase.RuleDomainCode)
-			response.OkWithMessage("编辑成功", c)
+			addBeans = append(addBeans, wafRuleService.BuildRuleBean(request.WafRuleAddReq{
+				RuleJson:     req.RuleJson,
+				IsManualRule: req.IsManualRule,
+				RuleStatus:   status,
+			}, hostRuleCode, ruleName, hostCode, hostContent, batchCode))
 		}
+	}
 
+	if len(addBeans) > 0 {
+		if err = wafRuleService.AddRulesApi(addBeans); err != nil {
+			response.FailWithMessage("编辑发生错误", c)
+			return
+		}
+	}
+	if len(removeCodes) > 0 {
+		if err = wafRuleService.DelRuleCodes(removeCodes); err != nil {
+			response.FailWithMessage("编辑发生错误", c)
+			return
+		}
+	}
+	//把批次码补给"刚刚从单站点扩成多站点"的原记录
+	if batchCode != "" && rule.BatchCode == "" {
+		if err = wafRuleService.SetBatchCodeApi(siblingCodes, batchCode); err != nil {
+			response.FailWithMessage("编辑发生错误", c)
+			return
+		}
+	}
+
+	//新老站点都要刷新：被取消的站点也要重新加载一次，否则旧规则会在引擎里留着(issue #898)
+	notifyHosts := append([]string{}, targetHosts...)
+	for _, sibling := range siblings {
+		notifyHosts = append(notifyHosts, sibling.HostCode)
+	}
+	for _, hostCode := range uniqueHostCodes(notifyHosts) {
+		w.NotifyWaf(hostCode)
+	}
+	if len(targetHosts) > 1 {
+		response.OkWithMessage(fmt.Sprintf("编辑成功，已同步到 %d 个网站", len(targetHosts)), c)
 	} else {
-		response.FailWithMessage("解析失败", c)
+		response.OkWithMessage("编辑成功", c)
 	}
 }
 
@@ -331,6 +573,10 @@ func (w *WafRuleAPi) BatchDelRuleApi(c *gin.Context) {
 	var req request.WafRuleBatchDelReq
 	err := c.ShouldBindJSON(&req)
 	if err == nil {
+		// 多站点规则是按网站拆成多行的，选中任意一行都要连带删除同批次的其他行，
+		// 否则会留下只认自己一个站点的半条规则
+		req.Codes = wafRuleService.ExpandBatchCodes(req.Codes)
+
 		// 先获取要删除的记录对应的HostCode，用于后续通知WAF引擎
 		hostCodes, err := wafRuleService.GetHostCodesByCodes(req.Codes)
 		if err != nil {
@@ -344,8 +590,10 @@ func (w *WafRuleAPi) BatchDelRuleApi(c *gin.Context) {
 			response.FailWithMessage("批量删除失败: "+err.Error(), c)
 		} else {
 			// 通知所有相关的网站更新配置
-			for _, hostCode := range hostCodes {
-				w.NotifyWaf(hostCode)
+			for _, hostCode := range uniqueHostCodes(hostCodes) {
+				if hostCode != "" {
+					w.NotifyWaf(hostCode)
+				}
 			}
 			response.OkWithMessage(fmt.Sprintf("成功删除 %d 条记录", len(req.Codes)), c)
 		}
@@ -451,9 +699,14 @@ func (w *WafRuleAPi) ModifyRuleStatusApi(c *gin.Context) {
 		if err != nil {
 			response.FailWithMessage("更新状态发生错误", c)
 		} else {
-			wafRule := wafRuleService.GetDetailByCodeApi(req.CODE)
-			//通知引擎重新加载某个网站的规则信息
-			w.NotifyWaf(wafRule.HostCode)
+			//多站点规则整组同步了状态，本批次涉及的网站都要通知引擎重新加载
+			ruleCodes := wafRuleService.ExpandBatchCodes([]string{req.CODE})
+			hostCodes, _ := wafRuleService.GetHostCodesByCodes(ruleCodes)
+			for _, hostCode := range uniqueHostCodes(hostCodes) {
+				if hostCode != "" {
+					w.NotifyWaf(hostCode)
+				}
+			}
 			response.OkWithMessage("状态更新成功", c)
 		}
 

@@ -72,6 +72,9 @@
           :headerAffixProps="{ offsetTop: offsetTop, container: getContainer }"
         ><template #host_code="{ row }">
             <span> {{host_dic[row.host_code]}}</span>
+            <t-tag v-if="row.batch_size > 1" theme="primary" variant="light" size="small" class="multi-host-tag">
+              {{ $t('page.rule.multi_host_tag', { count: row.batch_size }) }}
+            </t-tag>
           </template>
           <template #rule_status="{ row }">
             <t-switch size="small" v-model="row.rule_status === 1" :label="[$t('page.rule.rule_on'), $t('page.rule.rule_off')]"
@@ -271,7 +274,11 @@ export default Vue.extend({
   computed: {
     confirmBody() {
       if (this.deleteIdx > -1) {
-        const { host } = this.data?.[this.deleteIdx];
+        const row = this.data?.[this.deleteIdx];
+        //多站点规则删一条等于删一组，删除前先告知影响范围
+        if (row && row.batch_size > 1) {
+          return this.$t('page.rule.confirm_delete_multi', { count: row.batch_size });
+        }
         return this.$t('common.data_delete_warning');
       }
       return '';
@@ -659,6 +666,10 @@ export default Vue.extend({
 }
 .chain-mode-tag {
   margin-left: 8px;
+}
+/* 多站点规则的标记，跟在网站名后面 */
+.multi-host-tag {
+  margin-left: 6px;
 }
 .chain-mode-desc {
   color: var(--td-text-color-secondary, #666);

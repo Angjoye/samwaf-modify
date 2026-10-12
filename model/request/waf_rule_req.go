@@ -8,6 +8,9 @@ type WafRuleAddReq struct {
 	IsManualRule int    `json:"is_manual_rule"` // 0 是界面  1是纯代码
 	RuleContent  string `json:"rule_content"`   //规则内容
 	RuleStatus   int    `json:"rule_status"`    //规则状态 1 是开启 0 是关闭
+	//HostCodes 多选网站：一次提交覆盖多个站点，后端会为每个站点各生成一条规则记录并归入同一批次。
+	//为空时回退到 rule_json 里的 rule_domain_code，保持老前端/老调用方兼容。
+	HostCodes []string `json:"host_codes"`
 }
 type WafRuleDelReq struct {
 	CODE string `json:"code"`
@@ -21,6 +24,9 @@ type WafRuleEditReq struct {
 	IsManualRule int    `json:"is_manual_rule"`
 	RuleContent  string `json:"rule_content"` //规则内容
 	RuleStatus   int    `json:"rule_status"`  //规则状态 1 是开启 0 是关闭
+	//HostCodes 编辑时的目标站点集合：可增可减，后端会与批次内已有站点做差异同步。
+	//为空时沿用规则当前所属站点，保持老前端/老调用方兼容。
+	HostCodes []string `json:"host_codes"`
 }
 type WafRuleSearchReq struct {
 	HostCode string `json:"host_code" form:"host_code"` //主机码

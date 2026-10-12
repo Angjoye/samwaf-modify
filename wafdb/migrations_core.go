@@ -2385,6 +2385,36 @@ func RunCoreDBMigrations(db *gorm.DB) error {
 				return tx.Migrator().DropColumn(&model.ShareDb{}, "PeriodKey")
 			},
 		},
+		// 迁移: 自定义规则支持「多选网站」，新增批次码列。
+		//一条多站点规则在库里仍是每站点一条记录（引擎按 host_code 逐站点加载，逻辑不变），
+		//批次码把同一次提交产生的多条记录串成一组，供列表展示与批量编辑/删除使用。
+		//存量规则该列为空，按独立规则处理，行为完全不变。
+		{
+			ID: "202610120001_add_rules_batch_code",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202610120001: 自定义规则新增批次码列")
+				if tx.Migrator().HasColumn(&model.Rules{}, "batch_code") {
+					return nil
+				}
+				if err := tx.Migrator().AddColumn(&model.Rules{}, "BatchCode"); err != nil {
+					return fmt.Errorf("新增规则批次码列失败: %w", err)
+				}
+				//索引只影响查询速度，建不出来不该拦住启动，故失败仅告警
+				if !tx.Migrator().HasIndex(&model.Rules{}, "BatchCode") {
+					if err := tx.Migrator().CreateIndex(&model.Rules{}, "BatchCode"); err != nil {
+						zlog.Warn("创建规则批次码索引失败（非致命）", "error", err.Error())
+					}
+				}
+				zlog.Info("迁移 202610120001: 完成")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				if !tx.Migrator().HasColumn(&model.Rules{}, "batch_code") {
+					return nil
+				}
+				return tx.Migrator().DropColumn(&model.Rules{}, "BatchCode")
+			},
+		},
 	})
 
 	// 执行迁移
