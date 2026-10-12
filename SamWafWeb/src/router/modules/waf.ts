@@ -1,0 +1,480 @@
+import {
+  UserSafetyIcon, SystemSettingIcon, UsergroupIcon, SystemLogIcon, ApplicationIcon, LightingCircleIcon,
+  ServerIcon, ForkIcon, NotificationIcon, CloudIcon, UserCircleIcon
+} from 'tdesign-icons-vue';
+import Layout from '@/layouts/index.vue';
+
+export default [
+
+  {
+    path: '/waf-host',
+    name: 'wafhost',
+    component: Layout,
+    meta: { title: 'menu.host.parent_title', icon: ApplicationIcon },
+    children: [
+      {
+        path: 'wafhost',
+        name: 'WafHost',
+        component: () => import('@/pages/waf/host/index.vue'),
+        meta: { title: 'menu.host.host_title' },
+
+      },
+      {
+        path: 'wafrule',
+        name: 'WafRule',
+        component: () => import('@/pages/waf/rule/index.vue'),
+        meta: { title: 'menu.host.host_protect_rule' },
+      },
+      {
+        path: 'wafruleedit',
+        name: 'Wafruleedit',
+        component: () => import('@/pages/waf/rule/edit/index.vue'),
+        meta: { title: 'menu.host.host_protect_rule_edit', keepAlive: false, hidden: true },
+      },
+      {
+        path: 'wafipwhitelist',
+        name: 'WafIpWhiteList',
+        component: () => import('@/pages/waf/ipallow/index.vue'),
+        meta: { title: 'menu.host.allow_ip' },
+
+      },
+      {
+        path: 'wafurlwhitelist',
+        name: 'WafUrlWhiteList',
+        component: () => import('@/pages/waf/urlallow/index.vue'),
+        meta: { title: 'menu.host.allow_url' },
+
+      },
+
+      {
+        path: 'wafipBlocklist',
+        name: 'WafIpBlockList',
+        component: () => import('@/pages/waf/ipblock/index.vue'),
+        meta: { title: 'menu.host.deny_ip' },
+
+      },
+      {
+        path: 'wafipgroup',
+        name: 'WafIpGroup',
+        component: () => import('@/pages/waf/ipgroup/index.vue'),
+        meta: { title: 'menu.host.ip_group' },
+
+      },
+      {
+        path: 'wafurlblocklist',
+        name: 'WafUrlBlockList',
+        component: () => import('@/pages/waf/urlblock/index.vue'),
+        meta: { title: 'menu.host.deny_url' },
+
+      },
+      {
+        path: 'wafldpurllist',
+        name: 'WafLdpUrlList',
+        component: () => import('@/pages/waf/ldpurl/index.vue'),
+        meta: { title: 'menu.host.ldp_url' },
+
+      }, {
+        path: 'wafanticclist',
+        name: 'WafAntiCCList',
+        component: () => import('@/pages/waf/anticc/index.vue'),
+        meta: { title: 'menu.host.cc' },
+
+      },
+      {
+        path: 'wafsensitivelist',
+        name: 'WafSensitiveList',
+        component: () => import('@/pages/waf/sensitive/index.vue'),
+        meta: { title: 'menu.host.sensitive' },
+
+      }, {
+        path: 'wafsslconfiglist',
+        name: 'WafSSLConfigList',
+        component: () => import('@/pages/waf/sslconfig/index.vue'),
+        meta: { title: 'menu.host.sslconfig' },
+
+      }, {
+        path: 'wafbatchtasklist',
+        name: 'WafBatchTaskList',
+        component: () => import('@/pages/waf/batchtask/index.vue'),
+        meta: { title: 'menu.host.batchtask' },
+
+      }, {
+        path: 'wafsslOrderlist',
+        name: 'WafSSLOrderList',
+        component: () => import('@/pages/waf/sslorder/index.vue'),
+        meta: { title: 'menu.host.sslorder' },
+
+      },
+      {
+        path: 'wafsslExpirelist',
+        name: 'WafsslExpireList',
+        component: () => import('@/pages/waf/ssl_expire/index.vue'),
+        meta: { title: 'menu.host.ssl_expire' },
+
+      }, {
+        path: 'wafBlockingPagelist',
+        name: 'WafBlockingPagelist',
+        component: () => import('@/pages/waf/bLocking_page/index.vue'),
+        meta: { title: 'menu.host.blocking_page' },
+      },       {
+        path: 'wafIPFailure',
+        name: 'WafIPFailure',
+        component: () => import('@/pages/waf/ip_failure/index.vue'),
+        meta: { title: 'menu.host.ip_failure' },
+
+      },
+      {
+        path: 'wafFirewallIPBlock',
+        name: 'WafFirewallIPBlock',
+        component: () => import('@/pages/waf/firewall_ipblock/index.vue'),
+        meta: { title: 'menu.host.firewall_ip_block' },
+
+      },
+      {
+        path: 'wafThreatIP',
+        name: 'WafThreatIP',
+        component: () => import('@/pages/waf/threatip/index.vue'),
+        meta: { title: 'menu.host.threat_ip' },
+
+      },
+      {
+        path: 'wafCDNIP',
+        name: 'WafCDNIP',
+        component: () => import('@/pages/waf/cdnip/index.vue'),
+        meta: { title: 'menu.host.cdn_ip' },
+
+      },
+      {
+        path: 'wafPathRulelist',
+        name: 'WafPathRuleList',
+        component: () => import('@/pages/waf/path_rule/index.vue'),
+        meta: { title: 'menu.host.path_rule', hidden: true },
+      }
+    ],
+  },
+
+  {
+    path: '/wafanalysis',
+    name: 'wafanalysis',
+    component: Layout,
+    meta: { title: 'menu.analysis.parent_title', icon: SystemLogIcon },
+    children: [
+      {
+        path: 'wafanalysislog',
+        name: 'WafAnalysisLog',
+        component: () => import('@/pages/waf/analysis/index.vue'),
+        meta: { title: 'menu.analysis.analysis_title' },
+      },
+      {
+        path: 'wafanalysisSpiderlog',
+        name: 'WafAnalysisSpiderLog',
+        component: () => import('@/pages/waf/analysis/SpiderActive.vue'),
+        meta: { title: 'menu.analysis.analysis_spider_title' },
+      },
+      {
+        path: 'wafanalysissourcepath',
+        name: 'WafAnalysisSourcePath',
+        component: () => import('@/pages/waf/analysis/SourcePath.vue'),
+        meta: { title: 'menu.analysis.analysis_source_path_title' },
+      },
+    ],
+  },
+  {
+    path: '/waf',
+    name: 'waf',
+    component: Layout,
+    redirect: '/waf-log/visit',
+    meta: { title: 'menu.visit_log.parent_title', icon: LightingCircleIcon },
+    children: [
+      {
+        path: 'wafvisitlog',
+        name: 'WafvisitLog',
+        component: () => import('@/pages/waf/attack/index.vue'),
+        meta: { title: 'menu.visit_log.visit_title' },
+      },
+      {
+        path: 'wafattacklog',
+        name: 'WafAttackLog',
+        component: () => import('@/pages/waf/attack/attack_index.vue'),
+        meta: { title: 'menu.visit_log.attack_title' },
+      },
+      {
+        path: 'wafattacklogdetail',
+        name: 'WafAttackLogDetail',
+        component: () => import('@/pages/waf/attack/detail/index.vue'),
+        meta: { title: 'menu.visit_log.visit_detail_title', hidden: true, keepAlive: false }
+        ,
+
+      },
+      {
+        path: 'logfilewrite',
+        name: 'LogFileWrite',
+        component: () => import('@/pages/waf/logfilewrite/index.vue'),
+        meta: { title: 'menu.visit_log.logfilewrite_title' },
+      },
+    ],
+  },
+  {
+    path: '/tunnel',
+    name: 'tunnel',
+    component: Layout,
+    redirect: '/tunnel',
+    meta: { title: 'menu.tunnel.parent_title', icon: ForkIcon },
+    children: [
+      {
+        path: 'Tunnel',
+        name: 'Tunnel',
+        component: () => import('@/pages/waf/tunnel/index.vue'),
+        meta: { title: 'menu.tunnel.list_title' },
+      },
+    ],
+  },
+  {
+    path: '/application',
+    name: 'application',
+    component: Layout,
+    redirect: '/application',
+    meta: { title: 'menu.application.parent_title', icon: ServerIcon },
+    children: [
+      {
+        path: 'AppList',
+        name: 'AppList',
+        component: () => import('@/pages/waf/application/index.vue'),
+        meta: { title: 'menu.application.list_title' },
+      },
+    ],
+  },
+  {
+    // 统一访问认证(Access 模式)自成一个菜单组：它是一套完整的访客身份体系
+    // （账号 / 策略 / 会话 / 审计），与「网站防护」里那些按站点配的防护规则不是一类东西。
+    path: '/waf-access',
+    name: 'wafaccess',
+    component: Layout,
+    redirect: '/waf-access/wafaccessconfig',
+    meta: { title: 'menu.access.parent_title', icon: UserCircleIcon },
+    children: [
+      {
+        path: 'wafaccessconfig',
+        name: 'WafAccessConfig',
+        component: () => import('@/pages/waf/access_config/index.vue'),
+        meta: { title: 'menu.access.config' },
+      },
+      {
+        path: 'wafaccessaccount',
+        name: 'WafAccessAccount',
+        component: () => import('@/pages/waf/access_account/index.vue'),
+        meta: { title: 'menu.access.account' },
+      },
+      {
+        path: 'wafaccesssession',
+        name: 'WafAccessSession',
+        component: () => import('@/pages/waf/access_session/index.vue'),
+        meta: { title: 'menu.access.session' },
+      },
+    ],
+  },
+  {
+    path: '/account',
+    name: 'account',
+    component: Layout,
+    redirect: '/account',
+    meta: { title: 'menu.account.parent_title', icon: UsergroupIcon },
+    children: [
+      {
+        path: 'Account',
+        name: 'Account',
+        component: () => import('@/pages/waf/account/index.vue'),
+        meta: { title: 'menu.account.account_list_title' },
+      },
+      {
+        path: 'AccountLog',
+        name: 'AccountLog',
+        component: () => import('@/pages/waf/accountlog/index.vue'),
+        meta: { title: 'menu.account.account_log_title' },
+      },
+      {
+        path: 'LoginHistory',
+        name: 'LoginHistory',
+        component: () => import('@/pages/waf/login_history/index.vue'),
+        meta: { title: 'menu.account.login_history_title' },
+      },
+      {
+        path: 'OTP',
+        name: 'OTP',
+        component: () => import('@/pages/waf/otp/index.vue'),
+        meta: { title: 'menu.account.otp_title' },
+      },
+
+    ],
+  },
+  {
+    path: '/sys',
+    name: 'sys',
+    component: Layout,
+    redirect: '/sys',
+    meta: { title: 'menu.system.parent_title', icon: SystemSettingIcon },
+    children: [
+      {
+        path: 'VpConfig',
+        name: 'VpConfig',
+        component: () => import('@/pages/waf/vpconfig/index.vue'),
+        meta: {
+          title: 'menu.system.vpconfig_title',
+        }
+      },
+      {
+        path: 'HostGuard',
+        name: 'HostGuard',
+        component: () => import('@/pages/waf/hostguard/index.vue'),
+        meta: {
+          title: 'menu.system.host_guard_title',
+        }
+      },
+      {
+        path: 'FileManage',
+        name: 'FileManage',
+        component: () => import('@/pages/waf/filemanage/index.vue'),
+        meta: {
+          title: 'menu.system.filemanage_title',
+        }
+      },
+      {
+        path: 'IPLocation',
+        name: 'IPLocation',
+        component: () => import('@/pages/waf/iplocation/index.vue'),
+        meta: {
+          title: 'menu.system.iplocation_title',
+        }
+      },
+      {
+        path: 'SysLog',
+        name: 'SysLog',
+        component: () => import('@/pages/waf/syslog/index.vue'),
+        meta: { title: 'menu.system.system_log_title' },
+      },
+      {
+        path: 'wafaccessaudit',
+        name: 'WafAccessAudit',
+        component: () => import('@/pages/waf/access_audit/index.vue'),
+        meta: { title: 'menu.system.security_audit_title' },
+      },
+      {
+        path: 'SystemConfig',
+        name: 'SystemConfig',
+        component: () => import('@/pages/waf/systemconfig/index.vue'),
+        meta: { title: 'menu.system.system_config_title' },
+      },
+      {
+        path: 'UpgradeNotice',
+        name: 'UpgradeNotice',
+        component: () => import('@/pages/waf/upgradenotice/index.vue'),
+        meta: { title: 'menu.system.upgrade_notice_title' },
+      },
+      {
+        path: 'PrivateInfo',
+        name: 'PrivateInfo',
+        component: () => import('@/pages/waf/private_info/index.vue'),
+        meta: { title: 'menu.system.private_info_title' },
+      },
+      {
+        path: 'DataRetention',
+        name: 'DataRetention',
+        component: () => import('@/pages/waf/data_retention/index.vue'),
+        meta: { title: 'menu.system.data_retention_title' },
+      },
+      {
+        path: 'OwaspManage',
+        name: 'OwaspManage',
+        component: () => import('@/pages/waf/owasp/index.vue'),
+        meta: { title: 'menu.system.owasp_title' },
+      },
+      {
+        path: 'AIModelManage',
+        name: 'AIModelManage',
+        component: () => import('@/pages/waf/ai/index.vue'),
+        meta: { title: 'menu.system.ai_title' },
+      },
+      {
+        path: 'RumtimeSysteminfo',
+        name: 'RumtimeSysteminfo',
+        component: () => import('@/pages/waf/sysruntime/index.vue'),
+        meta: { title: 'menu.system.system_runtime_title' },
+      }, {
+        path: 'RunDiagnostic',
+        name: 'RunDiagnostic',
+        component: () => import('@/pages/waf/diagnostic/index.vue'),
+        meta: { title: 'menu.system.diagnostic_title' },
+      }, {
+        path: 'OneKeyMod',
+        name: 'OneKeyMod',
+        component: () => import('@/pages/waf/onekeymod/index.vue'),
+        meta: { title: 'menu.system.system_one_key_modify_title' },
+      }, {
+        path: 'task',
+        name: 'Task',
+        component: () => import('@/pages/waf/task/index.vue'),
+        meta: { title: 'menu.system.task' },
+      }, {
+        path: 'sqlquery',
+        name: 'SqlQuery',
+        component: () => import('@/pages/waf/sqlquery/index.vue'),
+        meta: { title: 'menu.system.sql_query_title' },
+      },
+    ],
+  },
+  {
+    path: '/notify',
+    name: 'notify',
+    component: Layout,
+    redirect: '/notify/channel',
+    meta: { title: 'menu.notify.parent_title', icon: NotificationIcon },
+    children: [
+      {
+        path: 'channel',
+        name: 'NotifyChannel',
+        component: () => import('@/pages/waf/notify_channel/index.vue'),
+        meta: { title: 'menu.notify.channel_title' },
+      },
+      {
+        path: 'subscription',
+        name: 'NotifySubscription',
+        component: () => import('@/pages/waf/notify_subscription/index.vue'),
+        meta: { title: 'menu.notify.subscription_title' },
+      },
+      {
+        path: 'log',
+        name: 'NotifyLog',
+        component: () => import('@/pages/waf/notify_log/index.vue'),
+        meta: { title: 'menu.notify.log_title' },
+      },
+    ],
+  },
+
+  {
+    path: '/oplatform',
+    name: 'oplatform',
+    component: Layout,
+    redirect: '/oplatform/key',
+    meta: { title: 'menu.oplatform.parent_title', icon: CloudIcon },
+    children: [
+      {
+        path: 'key',
+        name: 'OPlatformKey',
+        component: () => import('@/pages/waf/oplatform/index.vue'),
+        meta: { title: 'menu.oplatform.key_title' },
+      },
+      {
+        path: 'log',
+        name: 'OPlatformLog',
+        component: () => import('@/pages/waf/oplatform/log.vue'),
+        meta: { title: 'menu.oplatform.log_title' },
+      },
+      {
+        path: 'doc',
+        name: 'OPlatformDoc',
+        component: () => import('@/pages/waf/oplatform/doc.vue'),
+        meta: { title: 'menu.oplatform.doc_title' },
+      },
+    ],
+  },
+];

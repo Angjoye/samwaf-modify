@@ -1,0 +1,777 @@
+package wafmangeweb
+
+import (
+	"SamWaf/api"
+	"SamWaf/common/zlog"
+	"SamWaf/enums"
+	"SamWaf/global"
+	"SamWaf/middleware"
+	"SamWaf/router"
+	"SamWaf/service/waf_service"
+	"SamWaf/utils"
+	"SamWaf/wafmangeweb/static"
+	"SamWaf/wafnet"
+	"context"
+	"crypto/subtle"
+	"crypto/tls"
+	_ "embed"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-contrib/pprof"
+	"github.com/gin-gonic/gin"
+)
+
+//go:embed emergency_page.html
+var emergencyPageHTML string
+
+type WafWebManager struct {
+	HttpServer            *http.Server
+	R                     *gin.Engine
+	LogName               string
+	restartWatcherStarted bool
+	isShuttingDown        bool // 标记是否正在完全关闭（非重启）
+}
+
+// securityPathHandler 安全路径入口包装器
+// 动态读取全局变量，无需重启即可生效。
+//
+// 影响范围：此 handler 位于 http.Server 层，拦截所有进入管理端的请求，包括：
+//   - 管理界面浏览器访问（静态资源、SPA 路由）
+//   - WebSocket 连接（/api/v1/ws）
+//   - 开放平台 API Key 外部调用（/api/v1/oplatform/...）
+//   - 任何通过脚本/程序直接调用的 /api/v1/... 接口
+//
+// 启用后，所有调用方的 URL 均需改为：
+//
+//	http(s)://host:port/{安全码}/api/v1/...
+type securityPathHandler struct {
+	inner http.Handler // 内部 Gin Handler
+}
+
+func (h *securityPathHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 动态检查：安全路径未启用时直接透传
+	if !global.GWAF_SECURITY_ENTRY_ENABLE || global.GWAF_SECURITY_ENTRY_PATH == "" {
+		h.inner.ServeHTTP(w, r)
+		return
+	}
+
+	prefix := "/" + global.GWAF_SECURITY_ENTRY_PATH
+	path := r.URL.Path
+
+	// 精确匹配前缀（无尾斜杠），重定向到带斜杠版本
+	if path == prefix {
+		http.Redirect(w, r, prefix+"/", http.StatusMovedPermanently)
+		return
+	}
+
+	// 检查路径是否以 prefix/ 开头
+	if len(path) > len(prefix) && path[:len(prefix)+1] == prefix+"/" {
+		// 剥离安全路径前缀，让内部 Handler 看到原始路径
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = path[len(prefix):]
+		if r2.URL.Path == "" {
+			r2.URL.Path = "/"
+		}
+		// 同步更新 RequestURI
+		if r.URL.RawQuery != "" {
+			r2.RequestURI = r2.URL.Path + "?" + r.URL.RawQuery
+		} else {
+			r2.RequestURI = r2.URL.Path
+		}
+		h.inner.ServeHTTP(w, r2)
+		return
+	}
+
+	// 路径不匹配，返回 403
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte("403 Forbidden"))
+}
+
+// hybridConnContextKey 用于在请求 context 中存取本次连接对应的 *hybridConn
+type hybridConnContextKey struct{}
+
+// httpsRedirectHandler 最外层包装：当开启「仅允许HTTPS」且本次请求是纯 HTTP 连接时，
+// 返回 301 跳转到 https。仅在混合监听器（已加载有效证书）模式下生效；
+// 纯 HTTP 降级模式取不到 *hybridConn，不跳转，避免把用户锁死。
+type httpsRedirectHandler struct {
+	inner http.Handler
+}
+
+func (h *httpsRedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if global.GWAF_SSL_FORCE_HTTPS {
+		if hc, ok := r.Context().Value(hybridConnContextKey{}).(*hybridConn); ok && hc != nil && !hc.isTLS {
+			target := "https://" + r.Host + r.RequestURI
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+			return
+		}
+	}
+	h.inner.ServeHTTP(w, r)
+}
+
+func (web *WafWebManager) initRouter(r *gin.Engine) {
+
+	PublicRouterGroup := r.Group("")
+	PublicRouterGroup.Use(middleware.SecApi(), middleware.IPWhitelist(), middleware.DomainWhitelist(), middleware.ReplayProtect())
+	router.PublicApiGroupApp.InitLoginRouter(PublicRouterGroup)
+	router.PublicApiGroupApp.InitSecKeyRouter(PublicRouterGroup)
+
+	RouterGroup := r.Group("")
+	RouterGroup.Use(middleware.Auth(), middleware.ReplayProtect(), middleware.OpenApiLogMiddleware(), middleware.IPWhitelist(), middleware.DomainWhitelist(), middleware.SecApi(), middleware.GinGlobalExceptionMiddleWare())
+	{
+		// 共享/运维类接口：任意已登录角色可访问
+		router.ApiGroupApp.InitHostRouter(RouterGroup)
+		router.ApiGroupApp.InitHostGroupRouter(RouterGroup)
+		router.ApiGroupApp.InitLogRouter(RouterGroup)
+		router.ApiGroupApp.InitEngineRouter(RouterGroup)
+		router.ApiGroupApp.InitStatRouter(RouterGroup)
+		router.ApiGroupApp.InitLoginOutRouter(RouterGroup)
+		router.ApiGroupApp.InitWebSocketRouter(RouterGroup)
+		router.ApiGroupApp.InitSysInfoRouter(RouterGroup)
+		router.ApiGroupApp.InitWafCommonRouter(RouterGroup)
+		router.ApiGroupApp.InitOneKeyModRouter(RouterGroup)
+		router.ApiGroupApp.InitLicenseRouter(RouterGroup)
+		router.ApiGroupApp.InitLoadBalanceRouter(RouterGroup)
+		router.ApiGroupApp.InitSslConfigRouter(RouterGroup)
+		router.ApiGroupApp.InitBatchTaskRouter(RouterGroup)
+		router.ApiGroupApp.InitSslOrderRouter(RouterGroup)
+		router.ApiGroupApp.InitWafSslExpireRouter(RouterGroup)
+		router.ApiGroupApp.InitWafHttpAuthBaseRouter(RouterGroup)
+		router.ApiGroupApp.InitWafHttpAuthSessionRouter(RouterGroup)
+		router.ApiGroupApp.InitWafTaskRouter(RouterGroup)
+		router.ApiGroupApp.InitWafBlockingPageRouter(RouterGroup)
+		router.ApiGroupApp.InitGPTRouter(RouterGroup)
+		router.ApiGroupApp.InitAnalysisRouter(RouterGroup)
+		router.ApiGroupApp.InitWafPrivateInfoRouter(RouterGroup)
+		router.ApiGroupApp.InitWafPrivateGroupRouter(RouterGroup)
+		router.ApiGroupApp.InitWafCacheRuleRouter(RouterGroup)
+		router.ApiGroupApp.InitWafTamperRuleRouter(RouterGroup)
+		router.ApiGroupApp.InitWafTunnelRouter(RouterGroup)
+		router.ApiGroupApp.InitWafVpConfigRouter(RouterGroup)
+		router.ApiGroupApp.InitWafFileRouter(RouterGroup)
+		router.ApiGroupApp.InitWafSystemMonitorRouter(RouterGroup)
+		router.ApiGroupApp.InitWafCaServerInfoRouter(RouterGroup)
+		router.ApiGroupApp.InitNotifyChannelRouter(RouterGroup)
+		router.ApiGroupApp.InitNotifySubscriptionRouter(RouterGroup)
+		router.ApiGroupApp.InitNotifyLogRouter(RouterGroup)
+		router.ApiGroupApp.InitFirewallIPBlockRouter(RouterGroup)
+		router.ApiGroupApp.InitHostGuardRouter(RouterGroup)
+		router.ApiGroupApp.InitHostConnRouter(RouterGroup)
+		router.ApiGroupApp.InitThreatIPRouter(RouterGroup)
+		router.ApiGroupApp.InitCDNIPRouter(RouterGroup)
+		router.ApiGroupApp.InitIPLookupRouter(RouterGroup)
+		router.ApiGroupApp.InitLogFileWriteRouter(RouterGroup)
+		router.ApiGroupApp.InitIPLocationRouter(RouterGroup)
+		router.ApiGroupApp.InitWafDataRetentionRouter(RouterGroup)
+		router.ApiGroupApp.InitWafHostPathRuleRouter(RouterGroup)
+		// 界面偏好：按登录账号隔离（账号归属即授权边界），任意已登录角色均可存取本人的界面偏好
+		router.ApiGroupApp.InitWafUIPreferenceRouter(RouterGroup)
+
+		// 升级须知：只读查询 + 本机处理状态标记，首页提示条对所有角色都要可见
+		router.ApiGroupApp.InitUpgradeNoticeRouter(RouterGroup)
+
+		// 自助改密：任意已登录角色均可修改本人密码（含首次登录/到期强制改密场景），不受角色域限制
+		RouterGroup.POST("/api/v1/account/changemypwd", api.APIGroupAPP.WafAccountApi.ChangeMyPasswordApi)
+
+		// === 安全管理员域：WAF 防护策略/规则（三权分立强制点）===
+		securityAdminGroup := RouterGroup.Group("")
+		securityAdminGroup.Use(middleware.RequireRole(enums.ROLE_SECURITY_ADMIN))
+		{
+			router.ApiGroupApp.InitRuleRouter(securityAdminGroup)
+			router.ApiGroupApp.InitAllowIpRouter(securityAdminGroup)
+			router.ApiGroupApp.InitAllowUrlRouter(securityAdminGroup)
+			router.ApiGroupApp.InitLdpUrlRouter(securityAdminGroup)
+			router.ApiGroupApp.InitAntiCCRouter(securityAdminGroup)
+			router.ApiGroupApp.InitAntiCCRuleRouter(securityAdminGroup)
+			router.ApiGroupApp.InitIPFailureRouter(securityAdminGroup)
+			router.ApiGroupApp.InitBlockIpRouter(securityAdminGroup)
+			// IP组是黑/白名单与自定义规则共用的防护策略资源，与它们同属安全管理员域
+			router.ApiGroupApp.InitIPGroupRouter(securityAdminGroup)
+			router.ApiGroupApp.InitIPGroupItemRouter(securityAdminGroup)
+			router.ApiGroupApp.InitBlockUrlRouter(securityAdminGroup)
+			router.ApiGroupApp.InitSensitiveRouter(securityAdminGroup)
+			router.ApiGroupApp.InitWafOwaspRouter(securityAdminGroup)
+			// 统一访问认证：账号、策略配置、在线会话都是访问控制决策，属安全管理员域
+			// （它的审计日志归审计管理员，见下方 auditAdminGroup）
+			router.ApiGroupApp.InitAccessAccountRouter(securityAdminGroup)
+			router.ApiGroupApp.InitAccessConfigRouter(securityAdminGroup)
+			router.ApiGroupApp.InitAccessSessionRouter(securityAdminGroup)
+		}
+
+		// === 审计管理员域：操作/账号审计日志（只读，独立审计其余两员）===
+		auditAdminGroup := RouterGroup.Group("")
+		auditAdminGroup.Use(middleware.RequireRole(enums.ROLE_AUDIT_ADMIN))
+		{
+			router.ApiGroupApp.InitSysLogRouter(auditAdminGroup)
+			router.ApiGroupApp.InitAccountLogRouter(auditAdminGroup)
+			// 管理端登录历史：谁在什么时间从哪个IP登录了管理端，与账号审计同域
+			router.ApiGroupApp.InitLoginHistoryRouter(auditAdminGroup)
+			// 统一访问认证的审计日志：谁在什么时间从哪个IP登录了哪个站点。
+			// 放审计域而不是安全域，正是为了让安全管理员的动作也能被独立审计。
+			router.ApiGroupApp.InitAccessAuditRouter(auditAdminGroup)
+		}
+
+		// === 系统管理员域：系统配置 ===
+		systemConfigGroup := RouterGroup.Group("")
+		systemConfigGroup.Use(middleware.RequireRole(enums.ROLE_SYSTEM_ADMIN))
+		{
+			router.ApiGroupApp.InitSystemConfigRouter(systemConfigGroup)
+		}
+	}
+
+	// 仅允许后台 Token 登录访问，拒绝 API Key 访问（安全敏感接口）
+	// 整组归属「系统管理员域」：账户管理/OTP/开放平台Key/SQL查询/应用管理/AI模型均为系统级敏感操作
+	// superAdmin 兜底放行；空角色(历史账号)经 NormalizeRole 视为 superAdmin，向后兼容
+	TokenOnlyRouterGroup := r.Group("")
+	TokenOnlyRouterGroup.Use(middleware.TokenOnlyAuth(), middleware.RequireRole(enums.ROLE_SYSTEM_ADMIN), middleware.ReplayProtect(), middleware.IPWhitelist(), middleware.DomainWhitelist(), middleware.SecApi(), middleware.GinGlobalExceptionMiddleWare())
+	{
+		// 开放平台管理接口
+		router.ApiGroupApp.InitOPlatformKeyRouter(TokenOnlyRouterGroup)
+		router.ApiGroupApp.InitOPlatformLogRouter(TokenOnlyRouterGroup)
+		router.ApiGroupApp.InitOPlatformDocRouter(TokenOnlyRouterGroup)
+		// 账号管理：防止通过 API Key 删除/修改管理员账号
+		router.ApiGroupApp.InitAccountRouter(TokenOnlyRouterGroup)
+		// OTP 双因素认证管理：安全配置类接口
+		router.ApiGroupApp.InitWafOtpRouter(TokenOnlyRouterGroup)
+		// SQL 查询：直接执行数据库查询，极度敏感
+		router.ApiGroupApp.InitSqlQueryRouter(TokenOnlyRouterGroup)
+		// 应用管理：可执行任意命令，拒绝 API Key，功能默认关闭
+		router.ApiGroupApp.InitWafAppRouter(TokenOnlyRouterGroup)
+		// AI模型管理与训练数据导出：模型会被引擎加载、数据出库，拒绝 API Key
+		router.ApiGroupApp.InitWafAIRouter(TokenOnlyRouterGroup)
+		// 运行诊断：进程内部状态与性能采样数据导出，拒绝 API Key
+		router.ApiGroupApp.InitWafDiagnosticRouter(TokenOnlyRouterGroup)
+	}
+
+	// 保存 gin.Engine 引用供 API 文档生成使用
+	api.GinEngineRef = r
+
+	// 应急恢复页面（随机路径，无需认证，先于 NoRoute/静态文件注册）
+	if global.GWAF_SECURITY_EMERGENCY_PATH != "" {
+		emergencyPath := "/" + global.GWAF_SECURITY_EMERGENCY_PATH
+		// 注入应急路径占位符，供页面 JS 推导 API 基础路径
+		renderedPage := strings.ReplaceAll(emergencyPageHTML, "{{EMERGENCY_PATH}}", global.GWAF_SECURITY_EMERGENCY_PATH)
+		r.GET(emergencyPath, func(c *gin.Context) {
+			c.Header("Content-Type", "text/html; charset=utf-8")
+			c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+			c.String(200, renderedPage)
+		})
+		zlog.Info(web.LogName, "emergency page registered at: "+emergencyPath)
+	}
+
+	if global.GWAF_RELEASE == "true" {
+		static.Static(r, func(handlers ...gin.HandlerFunc) {
+			r.NoRoute(handlers...)
+		})
+		zlog.Info(web.LogName, "use static asset")
+	} else {
+		zlog.Info(web.LogName, "no use static asset")
+	}
+
+	//性能检测部分
+	if global.GCONFIG_RECORD_DEBUG_ENABLE == 1 {
+		zlog.Info(web.LogName, "Debug On")
+		// N8：加固
+		debugGroup := r.Group("/debug", middleware.IPWhitelist(), middleware.TokenOnlyAuth(), middleware.RequireRole(enums.ROLE_SYSTEM_ADMIN), func(c *gin.Context) {
+			if global.GCONFIG_RECORD_DEBUG_ENABLE == 0 {
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
+			if global.GCONFIG_RECORD_DEBUG_PWD != "" {
+				if subtle.ConstantTimeCompare([]byte(c.Request.Header.Get("Authorization")), []byte(global.GCONFIG_RECORD_DEBUG_PWD)) != 1 {
+					c.AbortWithStatus(http.StatusForbidden)
+					return
+				}
+			}
+			c.Next()
+		})
+		pprof.RouteRegister(debugGroup, "pprof")
+	}
+
+}
+func (web *WafWebManager) cors() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		method := c.Request.Method
+		origin := c.Request.Header.Get("Origin") //请求头部
+		// N9：仅对白名单内的 Origin 回显 CORS 头并允许携带凭证，杜绝"反射任意 Origin + Allow-Credentials"。
+		// 白名单 GCONFIG_CORS_ALLOW_ORIGINS（逗号分隔）默认空=不允许任何跨域；同源管理界面无需 CORS 头、不受影响。
+		if origin != "" && isCorsOriginAllowed(origin) {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE, UPDATE")
+			c.Header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization,X-Token,Remote-Waf-User-Id,OPEN-X-Token,X-Login-Type,X-Mobile-Token,X-API-Key,X-Request-Time,X-Request-Id,X-APP-OP-PASSWORD,X-Sec-Ver,X-Key-Id")
+			c.Header("Access-Control-Expose-Headers", "Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers, Cache-Control, Content-Language, Content-Type")
+			//允许客户端传递校验信息比如 cookie
+			c.Header("Access-Control-Allow-Credentials", "true")
+		}
+		if method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+		}
+		c.Next()
+	}
+}
+
+// isCorsOriginAllowed 判断 Origin 是否放行：回环/本机来源始终放行（开发环境 dev server、本地工具），
+// 其余需精确命中配置白名单 GCONFIG_CORS_ALLOW_ORIGINS（逗号分隔，大小写不敏感）。白名单为空=仅放行回环。
+func isCorsOriginAllowed(origin string) bool {
+	// 回环已被信任（能在本机环回起服务者已在本机），且管理端鉴权走 X-Token 头而非 Cookie，
+	// Allow-Credentials 对跨站攻击者无实益——故回环来源始终放行，避免误伤 dev/本地访问。
+	if isLoopbackOrigin(origin) {
+		return true
+	}
+	allow := strings.TrimSpace(global.GCONFIG_CORS_ALLOW_ORIGINS)
+	if allow == "" {
+		return false
+	}
+	for _, o := range strings.Split(allow, ",") {
+		if o = strings.TrimSpace(o); o != "" && strings.EqualFold(o, origin) {
+			return true
+		}
+	}
+	return false
+}
+
+// isLoopbackOrigin 判断 Origin 的主机是否为回环地址（127.0.0.0/8、::1、localhost，含 IPv4-mapped ::ffff:127.0.0.1）。
+// 注：这类地址只可能由本机上运行的页面作为 Origin 发出——远程攻击者无法让受害者浏览器在其回环地址上伺服页面，
+// 故"回环恒放行"不构成远程可利用的跨域面（详见漏洞台账 N9 残余风险）。
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// StartLocalServer 启动本地管理服务器
+func (web *WafWebManager) StartLocalServer() error {
+	if global.GWAF_RELEASE == "true" {
+		gin.SetMode(gin.ReleaseMode)
+		gin.DefaultWriter = io.Discard
+	}
+	if global.GWAF_IP_WHITELIST == "0.0.0.0/0,::/0" {
+		zlog.Warn("管理端未配置 IP 白名单，默认允许所有 IP4（0.0.0.0/0） IPv6 ::/0 访问")
+	}
+	r := gin.Default()
+	// 关闭 gin 默认的“信任全网代理头”：gin.Default() 默认 ForwardedByClientIP=true 且信任 0.0.0.0/0，
+	// 会让 c.ClientIP() 直接采信任意来源的 X-Forwarded-For/X-Real-IP。管理端一律以网络层对端为准，
+	// 需按可信代理识别真实客户端的地方统一走 utils.GetManageClientIP（读 GCONFIG_MANAGE_TRUSTED_PROXIES）。
+	_ = r.SetTrustedProxies(nil)
+	r.Use(web.cors()) //解决跨域
+	web.initRouter(r)
+
+	web.R = r
+
+	// 始终使用 securityPathHandler 包装，内部动态检查全局开关，无需重启即可生效
+	handler := &securityPathHandler{inner: r}
+	if global.GWAF_SECURITY_ENTRY_ENABLE && global.GWAF_SECURITY_ENTRY_PATH != "" {
+		zlog.Info(web.LogName, "安全路径入口已启用，访问码: "+global.GWAF_SECURITY_ENTRY_PATH)
+	}
+
+	web.HttpServer = &http.Server{
+		Addr:    ":" + strconv.Itoa(global.GWAF_LOCAL_SERVER_PORT),
+		Handler: &httpsRedirectHandler{inner: handler},
+		// 把混合连接指针放入请求 context，供 httpsRedirectHandler 判断本次请求是 HTTP 还是 HTTPS。
+		// 纯 HTTP 降级监听器产生的不是 *hybridConn，取不到 → 天然不强制跳转，避免无证书时把用户锁死。
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if hc, ok := c.(*hybridConn); ok {
+				return context.WithValue(ctx, hybridConnContextKey{}, hc)
+			}
+			return ctx
+		},
+	}
+
+	// 「仅允许HTTPS」开着却没启用 SSL 属矛盾配置：既然根本不打算提供 HTTPS，
+	// 这个开关就无从谈起。这里只告警不拒绝——拒绝会把"曾经开过 force_https、后来关掉 SSL"
+	// 的存量部署直接挡在门外，而这种组合多半是遗留值而非真实意图。
+	// 真正需要 fail-closed 的是"打算走 HTTPS 却拿不到证书"，那条在 serveHTTPFallback 里处理。
+	if global.GWAF_SSL_FORCE_HTTPS && !global.GWAF_SSL_ENABLE {
+		zlog.Warn(web.LogName, "已开启「仅允许HTTPS」但未启用SSL，该开关不生效，仍以HTTP提供服务；"+
+			"如需强制HTTPS请先启用SSL并配置证书")
+	}
+	err := waf_service.WafTokenInfoServiceApp.ReloadAllValidTokensToCache()
+	if err != nil {
+		zlog.Info("加载token到cache错误", err.Error())
+	}
+
+	// 启动重启信号监听（只启动一次）
+	if !web.restartWatcherStarted {
+		web.restartWatcherStarted = true
+		go web.WatchRestartSignal()
+	}
+
+	// 检查是否启用 SSL
+	if global.GWAF_SSL_ENABLE {
+		// 获取证书文件路径
+		certPath := filepath.Join(utils.GetCurrentDir(), "data", "ssl", "manager", "domain.crt")
+		keyPath := filepath.Join(utils.GetCurrentDir(), "data", "ssl", "manager", "domain.key")
+
+		// 检查证书文件是否存在
+		if _, err := os.Stat(certPath); err != nil {
+			zlog.Warn(web.LogName, "SSL证书文件不存在，降级使用 HTTP: ", certPath)
+			return web.serveHTTPFallback("管理端证书文件不存在")
+		}
+
+		if _, err := os.Stat(keyPath); err != nil {
+			zlog.Warn(web.LogName, "SSL私钥文件不存在，降级使用 HTTP: ", keyPath)
+			return web.serveHTTPFallback("管理端私钥文件不存在")
+		}
+
+		// 尝试加载证书
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			zlog.Warn(web.LogName, "SSL证书加载失败，降级使用 HTTP: ", err.Error())
+			return web.serveHTTPFallback("管理端证书加载失败：" + err.Error())
+		}
+
+		// 使用混合监听器，同时支持 HTTPS 和 HTTP（降级方案）
+		zlog.Info(web.LogName, "启动 HTTPS/HTTP 混合管理端, port:", global.GWAF_LOCAL_SERVER_PORT)
+		if err := web.listenAndServeHybrid(cert); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errMsg := fmt.Sprintf("启动管理界面失败: %s", err.Error())
+			zlog.Error(web.LogName, errMsg)
+			return err
+		}
+	} else {
+		// 使用 HTTP 启动服务
+		zlog.Info(web.LogName, "启动 HTTP 管理端, port:", global.GWAF_LOCAL_SERVER_PORT)
+		if err := web.listenAndServeHTTPReuse(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errMsg := fmt.Sprintf("启动管理界面失败: %s", err.Error())
+			zlog.Error(web.LogName, errMsg)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// httpsRequiredNotice 是 fail-closed 时回给访问者的全部内容。
+// 单独成函数是为了能被单测直接断言——这段文案是运维在管理端打不开时唯一的线索，
+// 少一条恢复路径就意味着有人得去翻源码。
+func httpsRequiredNotice(reason string) string {
+	return "管理端已开启「仅允许HTTPS」，但当前无法提供 HTTPS 服务。\n" +
+		"原因：" + reason + "\n\n" +
+		"为避免管理端以明文提供服务，已拒绝全部 HTTP 请求。\n" +
+		"恢复方式（任选其一，改完需重启 SamWaf）：\n" +
+		"  1. 修复管理端证书（data/ssl/manager/domain.crt 与 domain.key）\n" +
+		"  2. conf/config.yml 设 security.ssl_force_https: false —— 保留 HTTPS，同时允许 HTTP 访问\n" +
+		"  3. conf/config.yml 设 security.ssl_enable: false —— 关闭 HTTPS，回到纯 HTTP\n"
+}
+
+// httpsRequiredHandler 占住端口但不挂管理端路由：任何请求都只回 503 与修复指引。
+func httpsRequiredHandler(reason string) http.Handler {
+	notice := httpsRequiredNotice(reason)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(notice))
+	})
+}
+
+// serveHTTPFallback 处理"启用了 SSL 但拿不到可用证书"的情形。
+//
+// 分两种走向，取决于「仅允许HTTPS」：
+//   - 关闭（默认）：降级为纯 HTTP，保证管理端还能进——可用性优先，与历史行为一致。
+//   - 开启：**拒绝以明文提供管理端服务**。运维显式声明过"只走 HTTPS"，而证书过期/损坏
+//     恰恰是最常见的失败；此时若静默降级，管理端会在运维毫不知情的情况下以明文接受登录，
+//     口令明文过网。这里改为 fail-closed。
+//
+// fail-closed 不等于把端口一关了事——那样运维只看到"连接被拒绝"，无从判断原因。
+// 端口照常监听，但**不挂管理端路由**，任何请求只回 503 与修复指引：既不可能泄露任何东西，
+// 也不会让人误以为进程挂了。
+func (web *WafWebManager) serveHTTPFallback(reason string) error {
+	if !global.GWAF_SSL_FORCE_HTTPS {
+		zlog.Info(web.LogName, "启动 HTTP 管理端（降级模式）, port:", global.GWAF_LOCAL_SERVER_PORT)
+		if err := web.listenAndServeHTTPReuse(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errMsg := fmt.Sprintf("启动管理界面失败: %s", err.Error())
+			zlog.Error(web.LogName, errMsg)
+			return err
+		}
+		return nil
+	}
+
+	zlog.Error(web.LogName, "「仅允许HTTPS」已开启但无法提供 HTTPS（"+reason+"），已拒绝明文服务；"+
+		"请修复证书，或在 conf/config.yml 关闭 security.ssl_force_https / security.ssl_enable 后重启")
+
+	// 换掉 Handler：管理端路由不再挂载，明文端口上不会出现登录框或任何接口。
+	// 复用同一个 HttpServer 是为了让既有的优雅关闭/重启链路照常生效。
+	web.HttpServer.Handler = httpsRequiredHandler(reason)
+
+	zlog.Info(web.LogName, "启动 HTTP 管理端（仅回 503 提示，不提供管理功能）, port:", global.GWAF_LOCAL_SERVER_PORT)
+	if err := web.listenAndServeHTTPReuse(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errMsg := fmt.Sprintf("启动管理界面失败: %s", err.Error())
+		zlog.Error(web.LogName, errMsg)
+		return err
+	}
+	return nil
+}
+
+// listenAndServeHybrid 混合监听器，同时支持 HTTPS 和 HTTP
+func (web *WafWebManager) listenAndServeHybrid(cert tls.Certificate) error {
+	addr := web.HttpServer.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+
+	// 创建基础监听器（端口复用，支持升级重叠期新旧 Worker 同端口）
+	ln, err := wafnet.ReusePortTCPListen(addr)
+	if err != nil {
+		return err
+	}
+
+	// 创建混合监听器
+	hybridListener := &hybridListener{
+		Listener: ln,
+		cert:     cert,
+	}
+
+	// 使用混合监听器启动服务
+	return web.HttpServer.Serve(hybridListener)
+}
+
+// listenAndServeHTTPReuse 用端口复用监听启动 HTTP 管理端，
+// 使升级重叠期新旧 Worker 可同时绑定管理端口 :26666（旧 Worker 退出后由新 Worker 承接）。
+func (web *WafWebManager) listenAndServeHTTPReuse() error {
+	addr := web.HttpServer.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	ln, err := wafnet.ReusePortTCPListen(addr)
+	if err != nil {
+		return err
+	}
+	return web.HttpServer.Serve(ln)
+}
+
+// hybridListener 混合监听器，可以同时处理 HTTPS 和 HTTP 连接
+type hybridListener struct {
+	net.Listener
+	cert tls.Certificate
+}
+
+func (l *hybridListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// 返回混合连接，用于判断是 HTTPS 还是 HTTP
+	return &hybridConn{
+		Conn: conn,
+		cert: l.cert,
+	}, nil
+}
+
+// hybridConn 混合连接，可以自动识别 HTTPS 和 HTTP
+type hybridConn struct {
+	net.Conn
+	cert      tls.Certificate
+	tlsConn   *tls.Conn
+	firstRead bool
+	isTLS     bool
+}
+
+func (c *hybridConn) Read(b []byte) (n int, err error) {
+	// 第一次读取时判断是 TLS 还是普通 HTTP
+	if !c.firstRead {
+		c.firstRead = true
+
+		// 读取第一个字节来判断协议
+		firstByte := make([]byte, 1)
+		n, err := c.Conn.Read(firstByte)
+		if err != nil {
+			return 0, err
+		}
+
+		// TLS 握手的第一个字节是 0x16 (22)，表示 Handshake
+		if n > 0 && firstByte[0] == 0x16 {
+			// 这是 TLS 连接
+			c.isTLS = true
+
+			// 创建 TLS 配置
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{c.cert},
+				MinVersion:   tls.VersionTLS12,
+			}
+
+			// 创建 TLS 连接包装器
+			// 将第一个字节放回，让 TLS 握手可以正常进行
+			wrappedConn := &firstByteConn{
+				Conn:      c.Conn,
+				firstByte: firstByte[0],
+				firstRead: false,
+			}
+
+			c.tlsConn = tls.Server(wrappedConn, tlsConfig)
+
+			// 执行 TLS 握手
+			if err := c.tlsConn.Handshake(); err != nil {
+				zlog.Warn("WafWebManager", "TLS握手失败，尝试降级到HTTP: ", err.Error())
+				// TLS 握手失败，关闭连接
+				c.Conn.Close()
+				return 0, err
+			}
+
+			// 使用 TLS 连接读取数据
+			return c.tlsConn.Read(b)
+		} else {
+			// 这是普通 HTTP 连接
+			c.isTLS = false
+			zlog.Debug("WafWebManager", "检测到HTTP连接，使用降级模式")
+
+			// 将第一个字节放到缓冲区
+			if n > 0 {
+				b[0] = firstByte[0]
+				// 继续读取剩余数据
+				if len(b) > 1 {
+					n2, err2 := c.Conn.Read(b[1:])
+					return n + n2, err2
+				}
+				return 1, nil
+			}
+		}
+	}
+
+	// 后续读取
+	if c.isTLS && c.tlsConn != nil {
+		return c.tlsConn.Read(b)
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *hybridConn) Write(b []byte) (n int, err error) {
+	if c.isTLS && c.tlsConn != nil {
+		return c.tlsConn.Write(b)
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *hybridConn) Close() error {
+	if c.tlsConn != nil {
+		c.tlsConn.Close()
+	}
+	return c.Conn.Close()
+}
+
+// firstByteConn 用于将第一个字节放回连接
+type firstByteConn struct {
+	net.Conn
+	firstByte byte
+	firstRead bool
+}
+
+func (c *firstByteConn) Read(b []byte) (n int, err error) {
+	if !c.firstRead {
+		c.firstRead = true
+		if len(b) > 0 {
+			b[0] = c.firstByte
+			if len(b) > 1 {
+				n2, err2 := c.Conn.Read(b[1:])
+				return 1 + n2, err2
+			}
+			return 1, nil
+		}
+	}
+	return c.Conn.Read(b)
+}
+
+/*
+*
+关闭管理端web接口
+*/
+func (web *WafWebManager) CloseLocalServer() {
+	log.Println("ready to close local server")
+	// The context is used to inform the server it has 5 seconds to finish
+	// the request it is currently handling
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	defer func() {
+		defer cancel()
+	}()
+
+	if web != nil && web.HttpServer != nil {
+		if err := web.HttpServer.Shutdown(ctx); err != nil {
+			zlog.Error(web.LogName, "Server forced to shutdown:", err.Error())
+		}
+		zlog.Info(web.LogName, "local Server exiting")
+	} else {
+		zlog.Info("local Server exiting")
+	}
+
+}
+
+// WatchRestartSignal 监听重启信号
+func (web *WafWebManager) WatchRestartSignal() {
+	go func() {
+		// 使用 ticker 定期检查关闭信号
+		shutdownCheckTicker := time.NewTicker(500 * time.Millisecond)
+		defer shutdownCheckTicker.Stop()
+
+		for {
+			select {
+			case <-global.GWAF_CHAN_MANAGER_RESTART:
+				// 检查是否正在完全关闭系统
+				if global.GWAF_SHUTDOWN_SIGNAL || web.isShuttingDown {
+					zlog.Warn(web.LogName, "System is shutting down, ignoring restart request")
+					continue
+				}
+
+				zlog.Info(web.LogName, "Received manager restart signal, starting restart...")
+
+				// 关闭当前服务器
+				web.CloseLocalServer()
+
+				// 等待服务完全关闭
+				time.Sleep(2 * time.Second)
+
+				// 再次检查是否收到关闭信号
+				if global.GWAF_SHUTDOWN_SIGNAL || web.isShuttingDown {
+					zlog.Warn(web.LogName, "System is shutting down, canceling restart")
+					return
+				}
+
+				// SSL配置已经通过API更新到全局变量，直接使用即可
+				zlog.Info(web.LogName, "Current SSL configuration status: ", global.GWAF_SSL_ENABLE)
+
+				// 重新启动服务器
+				zlog.Info(web.LogName, "Restarting manager...")
+				go func() {
+					if err := web.StartLocalServer(); err != nil {
+						zlog.Error(web.LogName, "Failed to restart manager: ", err.Error())
+					}
+				}()
+
+				zlog.Info(web.LogName, "Manager restart completed")
+
+			case <-shutdownCheckTicker.C:
+				// 定期检查系统关闭信号，如果系统正在关闭则退出goroutine
+				if global.GWAF_SHUTDOWN_SIGNAL || web.isShuttingDown {
+					zlog.Info(web.LogName, "Detected system shutdown signal, exiting restart watcher")
+					return
+				}
+			}
+		}
+	}()
+}
+
+// Shutdown 完全关闭管理端
+func (web *WafWebManager) Shutdown() {
+	web.isShuttingDown = true
+	web.CloseLocalServer()
+}

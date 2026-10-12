@@ -1,0 +1,10 @@
+package enums
+
+const (
+	OP_TYPE_NEW = iota
+	OP_TYPE_UPDATE
+	OP_TYPE_DELETE
+	OP_TYPE_APP_START
+	OP_TYPE_APP_STOP
+	OP_TYPE_APP_RESTART
+)

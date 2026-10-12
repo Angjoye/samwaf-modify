@@ -1,0 +1,2267 @@
+package wafenginecore
+
+import (
+	"SamWaf/common/domaintool"
+	"SamWaf/common/uuid"
+	"SamWaf/common/zlog"
+	"SamWaf/customtype"
+	"SamWaf/enums"
+	"SamWaf/global"
+	"SamWaf/innerbean"
+	"SamWaf/model"
+	"SamWaf/model/baseorm"
+	"SamWaf/model/detection"
+	"SamWaf/model/wafenginmodel"
+	"SamWaf/utils"
+	"SamWaf/wafenginecore/loadbalance"
+	"SamWaf/wafenginecore/wafhttpcore"
+	"SamWaf/wafenginecore/wafhttpserver"
+	"SamWaf/wafenginecore/wafwebcache"
+	"SamWaf/wafnet"
+	"SamWaf/wafproxy"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
+	"net/url"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pires/go-proxyproto"
+	goahocorasick "github.com/samwafgo/ahocorasick"
+	"go.uber.org/zap"
+)
+
+type WafEngine struct {
+	//路由快照(RCU)：HostTarget/HostCode/HostTargetNoPort/HostTargetMoreDomain 收进不可变 routingTable，
+	//由 atomic.Pointer 持有。读热路径走 waf.rt() 无锁读；写者一律 copy-on-write(见 routing_table.go)。
+	//writeMu 串行化所有写者(增删 host/端口、字段级热更新)，保证发布的快照完整一致。
+	routing atomic.Pointer[routingTable]
+	writeMu sync.Mutex
+	//服务在线情况（key：端口，value :服务情况）
+	ServerOnline *wafenginmodel.SafeServerMap
+
+	AllCertificate      AllCertificate //所有证书
+	EngineCurrentStatus int            // 当前waf引擎状态
+
+	//敏感词管理
+	Sensitive        []model.Sensitive //敏感词
+	SensitiveManager *goahocorasick.Machine
+	// 敏感词检测方向映射，用于快速判断是否需要存在
+	SensitiveDirectionMap map[string]bool // key: "in"/"out"/"all", value: 是否存在
+
+	TransportPool map[string]*http.Transport // 添加Transport缓存池
+	TransportMux  sync.RWMutex               // 保护Transport池的读写锁
+
+	// 插件管理器（避免循环导入）
+	PluginManager interface{} // 使用 interface{} 避免导入 plugin/manager
+}
+
+func (waf *WafEngine) Error() string {
+	// 返回错误信息的固定格式
+	const errFormat = "WafEngine error occurred"
+	zlog.Error(errFormat)
+	return errFormat
+}
+
+// inferAttackType 根据检测规则标题推断攻击类型
+func inferAttackType(ruleTitle string) string {
+	ruleTitle = strings.ToLower(ruleTitle)
+
+	// OWASP CRS 拦截：Title 格式为 "owasp:<ruleID>"，需在其他关键词匹配之前优先处理
+	if strings.HasPrefix(ruleTitle, "owasp:") {
+		return "owasp_attack"
+	}
+
+	// AI 智能检测：Title 格式为 "AI检测:score=x.xx"，需在 SQL/RCE 等关键词匹配之前优先处理
+	if strings.HasPrefix(ruleTitle, "ai检测") {
+		return "ai_attack"
+	}
+
+	// CC攻击
+	if strings.Contains(ruleTitle, "cc") || strings.Contains(ruleTitle, "频次") || strings.Contains(ruleTitle, "rate limit") {
+		return "cc_attack"
+	}
+
+	// SQL注入
+	if strings.Contains(ruleTitle, "sql") || strings.Contains(ruleTitle, "注入") {
+		return "sql_injection"
+	}
+
+	// CSRF跨站请求伪造（必须先于 XSS 判断，因 XSS 分支会匹配"跨站"）
+	if strings.Contains(ruleTitle, "csrf") || strings.Contains(ruleTitle, "跨站请求") {
+		return "csrf_attack"
+	}
+
+	// XSS攻击
+	if strings.Contains(ruleTitle, "xss") || strings.Contains(ruleTitle, "跨站") {
+		return "xss_attack"
+	}
+
+	// 扫描工具
+	if strings.Contains(ruleTitle, "scan") || strings.Contains(ruleTitle, "扫描") {
+		return "scan_tool"
+	}
+
+	// 文件上传内容检测（含 Webshell）
+	if strings.Contains(ruleTitle, "文件上传") || strings.Contains(ruleTitle, "upload") || strings.Contains(ruleTitle, "webshell") {
+		return "upload_attack"
+	}
+
+	// RCE远程代码执行
+	if strings.Contains(ruleTitle, "rce") || strings.Contains(ruleTitle, "代码执行") || strings.Contains(ruleTitle, "命令执行") {
+		return "rce_attack"
+	}
+
+	// 目录穿越
+	if strings.Contains(ruleTitle, "traversal") || strings.Contains(ruleTitle, "穿越") || strings.Contains(ruleTitle, "目录") {
+		return "dir_traversal"
+	}
+
+	// Bot爬虫
+	if strings.Contains(ruleTitle, "bot") || strings.Contains(ruleTitle, "爬虫") {
+		return "bot_attack"
+	}
+
+	// 敏感词
+	if strings.Contains(ruleTitle, "sensitive") || strings.Contains(ruleTitle, "敏感词") {
+		return "sensitive_word"
+	}
+
+	// IP黑名单
+	if strings.Contains(ruleTitle, "ip") && (strings.Contains(ruleTitle, "黑名单") || strings.Contains(ruleTitle, "block") || strings.Contains(ruleTitle, "deny")) {
+		return "ip_blocked"
+	}
+
+	// URL黑名单
+	if strings.Contains(ruleTitle, "url") && (strings.Contains(ruleTitle, "黑名单") || strings.Contains(ruleTitle, "block") || strings.Contains(ruleTitle, "deny")) {
+		return "url_blocked"
+	}
+
+	// 防盗链
+	if strings.Contains(ruleTitle, "leech") || strings.Contains(ruleTitle, "防盗链") || strings.Contains(ruleTitle, "hotlink") {
+		return "anti_leech"
+	}
+
+	// 自定义规则
+	if strings.Contains(ruleTitle, "rule") || strings.Contains(ruleTitle, "规则") {
+		return "custom_rule"
+	}
+
+	// OWASP规则
+	if strings.Contains(ruleTitle, "owasp") {
+		return "owasp_rule"
+	}
+
+	// 插件拦截
+	if strings.Contains(ruleTitle, "plugin") || strings.Contains(ruleTitle, "插件") {
+		return "plugin_block"
+	}
+
+	// 默认返回通用拦截类型
+	return ""
+}
+func (waf *WafEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	innerLogName := "WafEngine ServeHTTP"
+	global.IncrementQPS() // 使用统一的QPS增量函数
+
+	// 调试：标记响应由哪个 Worker 进程处理（SAMWAF_WORKER_HEADER=1 开启），用于验证升级时新旧 Worker 交替。
+	// 在最前面设置，反向代理会追加上游响应头而不清除此处已设置的值。
+	if global.GWAF_DEBUG_WORKER_HEADER {
+		w.Header().Set("X-SamWaf-Worker", global.GWAF_WORKER_TAG)
+	}
+
+	port := ""
+	host := r.Host
+	if !strings.Contains(host, ":") {
+		// 检查请求是否使用了HTTPS
+		if r.TLS != nil {
+			// 请求使用了HTTPS
+			host = host + ":443"
+		} else {
+			// 请求使用了HTTP
+			host = host + ":80"
+		}
+	}
+	// 从 host 字符串中提取端口
+	if strings.Contains(host, ":") {
+		parts := strings.Split(host, ":")
+		if len(parts) == 2 {
+			port = parts[1]
+		}
+	}
+	defer func() {
+		e := recover()
+		if e != nil {
+			// 检查是否是连接断开相关的错误
+			if e == http.ErrAbortHandler {
+				fmt.Printf("Client connection aborted: %s\n", r.URL.Path)
+				return
+			}
+			// 其他类型的panic才打印详细堆栈
+			fmt.Printf("Unexpected error in request handler: %v\n", e)
+			debug.PrintStack()
+		}
+	}()
+	targetCode := ""
+	//检测是否是不检测端口的情况
+	if targetHost, ok := waf.rt().HostTargetNoPort[utils.GetPureDomain(host)]; ok {
+		host = targetHost
+	}
+	findHost := false
+	target, ok := waf.rt().HostTarget[host]
+	if !ok {
+		// 看看是不是泛域名情况
+		target, ok = waf.rt().HostTarget[domaintool.MaskSubdomain(host)]
+		if ok {
+			findHost = true
+			targetCode = target.Host.Code
+		}
+	} else {
+		targetCode = target.Host.Code
+		findHost = true
+	}
+
+	if !findHost {
+		// 绑定更多域名的信息
+		targetCode, ok = waf.rt().HostTargetMoreDomain[host]
+		if ok {
+			findHost = true
+		} else {
+			// 看看是不是泛域名情况
+			targetCode, ok = waf.rt().HostTargetMoreDomain[domaintool.MaskSubdomain(host)]
+			if ok {
+				findHost = true
+			}
+		}
+	}
+
+	//检测是否是宽松端口且是不指定域名的情况
+	if targetHost, ok := waf.rt().HostTargetNoPort["*"]; ok {
+		host = targetHost
+		//检测是否存在不指定域名的情况
+		target, ok = waf.rt().HostTarget[host]
+		if ok {
+			findHost = true
+			targetCode = target.Host.Code
+			zlog.Debug(fmt.Sprintf("%s %s", innerLogName, "触发*逻辑和来源port"))
+		}
+	} else {
+		//检测是否存在不指定域名的情况
+		target, ok = waf.rt().HostTarget["*:"+port]
+		if ok {
+			findHost = true
+			targetCode = target.Host.Code
+			zlog.Debug(fmt.Sprintf("%s %s", innerLogName, "触发*逻辑"))
+		}
+	}
+
+	// 检查域名是否已经注册
+	if findHost == true {
+		hostTarget := waf.rt().HostTarget[waf.rt().HostCode[targetCode]]
+		hostCode := hostTarget.Host.Code
+
+		incrementMonitor(hostCode)
+		defer decrementMonitor(hostCode)
+
+		// 站点流量计量：直接量真实进出字节，静态资源/大文件/chunked/流式/被拦截响应全都算得到。
+		// 必须在这里（host 已解析、任何响应写出之前）包一次，之后所有出口都用包装后的 w。
+		// 分桶时间取「此刻」，不是落库时刻，否则跨天/跨整点的账会记到错误的桶里。（issue #930）
+		meteredWriter, settleTraffic := attachTrafficMeter(w, r, hostCode, r.Host)
+		w = meteredWriter
+		defer settleTraffic()
+		//检测网站是否已关闭
+		if hostTarget.Host.START_STATUS == 1 {
+			resBytes := []byte("<html><head><title>网站已关闭</title></head><body><center><h1>当前访问网站已关闭</h1> <br><h3></h3></center></body> </html>")
+
+			w.WriteHeader(http.StatusServiceUnavailable)
+			if _, writeErr := w.Write(resBytes); writeErr != nil {
+				zlog.Debug("write fail:", zap.Any("err", writeErr))
+				return
+			}
+
+			return
+		}
+		// 取出客户IP（按 host 的真实IP来源模式加固；IPSourceMode 为空时保持旧行为——取配置头最左第一个）
+		ipErr, clientIP, clientPort := waf.getBizClientIP(r, hostTarget.Host)
+		if ipErr != nil {
+			zlog.Error("get client error", ipErr.Error())
+			return
+		}
+		// 记录一份"真实IP来源"诊断采样(每站每秒最多一条)，供管理端配置页直接查看实际到达的请求头
+		recordIPProbe(hostTarget.Host, r, clientIP)
+		_, ok := waf.ServerOnline.Get(hostTarget.Host.Remote_port)
+		//检测如果访问IP和远程IP是同一个IP，且远程端口在本地Server已存在则显示配置错误
+		if clientIP == hostTarget.Host.Remote_ip && ok == true {
+			resBytes := []byte("500: 配置有误" + host + " 当前IP和访问远端IP一样，且端口也一样，会造成循环问题")
+			_, err := w.Write(resBytes)
+			if err != nil {
+				zlog.Debug("write fail:", zap.Any("", err))
+				return
+			}
+			return
+		}
+
+		// 静态站点服务检查
+		staticSiteConfig := InitDefaultStaticSiteConfig()
+		err := json.Unmarshal([]byte(hostTarget.Host.StaticSiteJSON), &staticSiteConfig)
+		if err != nil {
+			zlog.Debug("解析static site json失败")
+		}
+
+		//检测cache
+		cacheConfig := model.CacheConfig{
+			IsEnableCache:   0,
+			CacheLocation:   "",
+			CacheDir:        "",
+			MaxFileSizeMB:   0,
+			MaxMemorySizeMB: 0,
+		}
+		err = json.Unmarshal([]byte(hostTarget.Host.CacheJSON), &cacheConfig)
+		if err != nil {
+			zlog.Debug("解析cache json失败")
+		}
+
+		// 获取请求报文的内容长度（chunked 时 Go 给 -1，先归一，避免统计出现负数）
+		contentLength := sanitizeContentLength(r.ContentLength)
+		var bodyByte []byte
+
+		// 拷贝一份request的Body ,控制不记录大文件的情况
+		if r.Body != nil && r.Body != http.NoBody && (contentLength > 0) && (contentLength < (global.GCONFIG_RECORD_MAX_BODY_LENGTH) || cacheConfig.IsEnableCache == 1) {
+			// 检查请求是否包含Content-Encoding
+			if r.Header.Get("Content-Encoding") != "" {
+				// 处理压缩的请求体
+				decompressedBytes, decompressErr := waf.decompressRequestContent(r)
+				if decompressErr != nil {
+					zlog.Warn("请求Content-Encoding处理失败: %v", decompressErr)
+					// 如果解压失败，使用原始内容
+					bodyByte, _ = io.ReadAll(r.Body)
+					r.Body = io.NopCloser(bytes.NewBuffer(bodyByte))
+				} else {
+					bodyByte = decompressedBytes
+					// 请求体已经在decompressRequestContent中更新
+				}
+			} else {
+				// 没有压缩，正常处理
+				bodyByte, _ = io.ReadAll(r.Body)
+				// 把刚刚读出来的再写进去，不然后面解析表单数据就解析不到了
+				r.Body = io.NopCloser(bytes.NewBuffer(bodyByte))
+			}
+		}
+		cookies, _ := json.Marshal(r.Cookies())
+
+		header := joinHeader(r.Header)
+
+		region, geoResolved := utils.GetCountryEx(clientIP)
+
+		currentDay, _ := strconv.Atoi(time.Now().Format("20060102"))
+
+		//URL 解码
+		deRawQueryUrl := wafhttpcore.WafHttpCoreUrlEncode(r.URL.RawQuery, 10)
+		datetimeNow := time.Now()
+		weblogbean := innerbean.WebLog{
+			HOST:                 r.Host,
+			URL:                  r.RequestURI,
+			RawQuery:             deRawQueryUrl,
+			REFERER:              r.Referer(),
+			USER_AGENT:           r.UserAgent(),
+			METHOD:               r.Method,
+			HEADER:               header,
+			COUNTRY:              region[0],
+			PROVINCE:             region[2],
+			CITY:                 region[3],
+			SRC_IP:               clientIP,
+			SRC_PORT:             clientPort,
+			CREATE_TIME:          datetimeNow.Format("2006-01-02 15:04:05"),
+			UNIX_ADD_TIME:        datetimeNow.UnixNano() / 1e6,
+			CONTENT_LENGTH:       contentLength,
+			COOKIES:              string(cookies),
+			BODY:                 string(bodyByte),
+			REQ_UUID:             uuid.GenUUID(),
+			USER_CODE:            global.GWAF_USER_CODE,
+			HOST_CODE:            hostCode,
+			TenantId:             global.GWAF_TENANT_ID,
+			RULE:                 "",
+			ACTION:               "通过",
+			Day:                  currentDay,
+			POST_FORM:            r.PostForm.Encode(),
+			TASK_FLAG:            -1,
+			RISK_LEVEL:           0,      //危险等级
+			GUEST_IDENTIFICATION: "正常访客", //访客身份识别
+			TimeSpent:            0,
+			NetSrcIp:             utils.GetSourceClientIP(r.RemoteAddr),
+			GeoUnresolved:        !geoResolved,
+			SrcByteBody:          bodyByte,
+			WebLogVersion:        global.GWEBLOG_VERSION,
+			Scheme:               r.Proto,
+			SrcURL:               []byte(r.RequestURI),
+		}
+		// 检查是否为WebSocket升级请求
+		if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
+			if r.TLS != nil {
+				weblogbean.HOST = "wss://" + weblogbean.HOST
+			} else {
+				weblogbean.HOST = "ws://" + weblogbean.HOST
+			}
+		} else if r.TLS != nil {
+			weblogbean.HOST = "https://" + weblogbean.HOST
+		} else {
+			weblogbean.HOST = "http://" + weblogbean.HOST
+		}
+
+		// ── ACME(HTTP-01) 证书校验快速通道 ──
+		if waf.tryServeACMEChallenge(w, r, &weblogbean) {
+			return
+		}
+
+		formValues := url.Values{}
+		if strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+			// 解码 x-www-form-urlencoded 数据
+			formValuest, err := url.ParseQuery(weblogbean.BODY)
+			if err == nil {
+				formValues = formValuest
+			} else {
+				fmt.Println("解码失败:", err)
+				fmt.Println("解码失败:", weblogbean.BODY)
+			}
+		}
+
+		// S1 归一化：为检测生成解码副本（原文保留用于落库/展示），覆盖 body、cookie
+		// 及多层编码的表单值绕过面；各 check 改吃这些解码副本。
+		weblogbean.BodyDecoded = wafhttpcore.NormalizeForDetection(weblogbean.BODY)
+		weblogbean.CookiesDecoded = wafhttpcore.NormalizeForDetection(weblogbean.COOKIES)
+		// JSON 体逐值提取（json 解析天然解 \uXXXX）+ 直接父键名，供 XSS/SQLi 逐值检测(避免整块喂
+		// libinjection 造成误报)与“按字段排除”(E)
+		weblogbean.BodyFields, weblogbean.BodyValues = wafhttpcore.ExtractJSONFieldValues(weblogbean.BODY)
+		for k, vals := range formValues {
+			for i, v := range vals {
+				formValues[k][i] = wafhttpcore.NormalizeForDetection(v)
+			}
+		}
+
+		if r.TLS == nil {
+			// 检查是否需要自动跳转到HTTPS
+			shouldJump, domainJump := shouldAutoJumpHTTPS(host, hostTarget.Host.Host, weblogbean.URL, hostTarget.Host.AutoJumpHTTPS, hostTarget.Host.Ssl)
+			if shouldJump {
+				// 重定向到 HTTPS 版本的 URL
+				targetHttpsUrl := fmt.Sprintf("%s%s%s", "https://", domainJump, r.URL.Path)
+				// 只有在非标准端口时才显示端口号（443是标准端口）
+				if hostTarget.Host.Port != 443 {
+					targetHttpsUrl = fmt.Sprintf("%s%s:%d%s", "https://", domainJump, hostTarget.Host.Port, r.URL.Path)
+				}
+				if r.URL.RawQuery != "" {
+					targetHttpsUrl += "?" + r.URL.RawQuery
+				}
+				zlog.Info(innerLogName, "jump https", targetHttpsUrl)
+				http.Redirect(w, r, targetHttpsUrl, int(global.GCONFIG_RECORD_REDIRECT_HTTPS_CODE))
+				return
+			}
+		}
+
+		// 反向代理环路检测：SamWaf 每转发一跳就把 waf_req_hop 递增并带给后端；
+		maxHop := int(global.GCONFIG_RECORD_PROXY_LOOP_MAX_HOP)
+		if maxHop > 0 {
+			hop := 0
+			if v := r.Header.Get("waf_req_hop"); v != "" {
+				hop, _ = strconv.Atoi(v)
+			}
+			if hop >= maxHop {
+				// 告警节流：同一 host 5 分钟内只发一次，避免环路把告警刷爆
+				loopAlertKey := "proxy_loop_alert_" + hostCode
+				if !global.GCACHE_WAFCACHE.IsKeyExist(loopAlertKey) {
+					global.GCACHE_WAFCACHE.SetWithTTl(loopAlertKey, "1", 5*time.Minute)
+					serverName := global.GWAF_CUSTOM_SERVER_NAME
+					if serverName == "" {
+						serverName = "未命名服务器"
+					}
+					global.GQEQUE_MESSAGE_DB.Enqueue(innerbean.SystemErrorMessageInfo{
+						BaseMessageInfo: innerbean.BaseMessageInfo{
+							OperaType: "反向代理环路拦截",
+							Server:    serverName,
+						},
+						ErrorType: "反向代理环路",
+						ErrorMsg:  fmt.Sprintf("检测到反向代理环路，已拦截。Host:%s 访客IP:%s 跳数:%d(阈值:%d)，请检查该站点后端是否回指SamWaf自身", weblogbean.HOST, weblogbean.SRC_IP, hop, maxHop),
+						Time:      time.Now().Format("2006-01-02 15:04:05"),
+					})
+				}
+				zlog.Warn("反向代理环路拦截", weblogbean.HOST, weblogbean.SRC_IP, hop)
+				// isLog=false：不走 EchoErrorInfo 内置的"命中保护规则"推送（那条不节流、且把运维故障误标成攻击）；
+				// 通知只保留上面那条节流且语义准确的系统告警。响应仍支持按 proxy_loop 拦截页配置返回自定义码（含508）
+				// proxy_loop 默认下发 508 Loop Detected（EchoErrorInfo 内置按类型特判）；用户配了 proxy_loop 拦截页则以其为准
+				loopRespCode := EchoErrorInfo(w, r, &weblogbean, "反向代理环路", "检测到反向代理环路，请求已被终止", hostTarget, waf.rt().HostTarget[waf.rt().HostCode[global.GWAF_GLOBAL_HOST_CODE]], false, "proxy_loop")
+				// 手动补一条拦截 weblog，保证攻击日志/仪表盘有记录（等价于 EchoErrorInfo 的 isLog 分支，但不发重复推送）
+				weblogbean.TimeSpent = time.Now().UnixNano()/1e6 - weblogbean.UNIX_ADD_TIME
+				weblogbean.RULE = "反向代理环路"
+				weblogbean.ACTION = "阻止"
+				weblogbean.STATUS = "阻止访问"
+				weblogbean.STATUS_CODE = loopRespCode // 与实际下发码一致（默认508，或用户自定义拦截页配置的码）
+				weblogbean.TASK_FLAG = 1
+				weblogbean.GUEST_IDENTIFICATION = "可疑用户"
+				global.GQEQUE_LOG_DB.Enqueue(&weblogbean)
+				return
+			}
+			r.Header.Set("waf_req_hop", strconv.Itoa(hop+1))
+		}
+
+		r.Header.Set("waf_req_uuid", weblogbean.REQ_UUID) // Set 替换，保证每请求恒为单值，避免入站累积
+
+		if hostTarget.Host.GUARD_STATUS == 1 {
+			//自定义规则放行动作的结果：ruleSkipAll 跳过后续所有检测，ruleSkipModules 跳过指定检测
+			ruleSkipAll := false
+			ruleSkipModules := map[string]bool{}
+			//是否要跳过某个检测模块
+			ruleSkip := func(module string) bool {
+				return ruleSkipAll || ruleSkipModules[module]
+			}
+			//一系列检测逻辑
+			handleBlock := func(checkFunc func(*http.Request, *innerbean.WebLog, url.Values, *wafenginmodel.HostSafe, *wafenginmodel.HostSafe) detection.Result) bool {
+				detectionResult := checkFunc(r, &weblogbean, formValues, hostTarget, waf.rt().HostTarget[waf.rt().HostCode[global.GWAF_GLOBAL_HOST_CODE]])
+				//自定义规则放行：不拦截，按需跳过后续检测
+				if detectionResult.IsRuleAllow {
+					if detectionResult.JumpGuardResult {
+						ruleSkipAll = true
+					}
+					for _, m := range detectionResult.SkipModules {
+						if m == utils.RuleSkipAll {
+							ruleSkipAll = true
+						} else {
+							ruleSkipModules[m] = true
+						}
+					}
+					weblogbean.RULE = "自定义规则放行:" + detectionResult.Title
+					return false
+				}
+				//自定义规则仅记录：记录命中信息，继续走后续检测
+				if detectionResult.IsLogOnly {
+					weblogbean.RULE = "自定义规则记录:" + detectionResult.Title
+					return false
+				}
+				if detectionResult.IsBlock {
+					if hostTarget.Host.LogOnlyMode == 1 {
+						// 仅记录模式：记录攻击日志但不阻断请求
+						weblogbean.LogOnlyMode = 1
+						weblogbean.RULE = detectionResult.Title
+						return false
+					} else {
+						decrementMonitor(hostCode)
+						// 根据检测结果的标题推断攻击类型
+						attackType := inferAttackType(detectionResult.Title)
+						EchoErrorInfo(w, r, &weblogbean, detectionResult.Title, detectionResult.Content, hostTarget, waf.rt().HostTarget[waf.rt().HostCode[global.GWAF_GLOBAL_HOST_CODE]], true, attackType)
+						return true
+					}
+				}
+				return false
+			}
+			globalHostSafe := waf.rt().HostTarget[waf.rt().HostCode[global.GWAF_GLOBAL_HOST_CODE]]
+
+			// 插件预检查（在所有检测之前）
+			if handleBlock(func(r *http.Request, weblogbean *innerbean.WebLog, formValues url.Values, hostTarget *wafenginmodel.HostSafe, globalHost *wafenginmodel.HostSafe) detection.Result {
+				return waf.checkWithPlugins(r, weblogbean, hostTarget, "pre_check")
+			}) {
+				// 插件拦截，记录日志并返回
+				return
+			}
+
+			// 检测白名单开始
+			detectionWhiteResult := detection.Result{JumpGuardResult: false}
+			checkFunctions := []func(*http.Request, *innerbean.WebLog, url.Values, *wafenginmodel.HostSafe, *wafenginmodel.HostSafe) detection.Result{
+				waf.CheckAllowIP,
+				waf.CheckAllowURL,
+				waf.CheckAllowCallBackIP,
+			}
+			for _, checkFunc := range checkFunctions {
+				detectionWhiteResult = checkFunc(r, &weblogbean, formValues, hostTarget, globalHostSafe)
+				if detectionWhiteResult.JumpGuardResult == true {
+					break
+				}
+			}
+			//检测白名单结束
+			if detectionWhiteResult.JumpGuardResult == false {
+
+				// CC 封禁期拦截。位置有两个讲究：
+				// 一是放在 GUARD_STATUS 判断之内——站点关闭防护后不该再拦；
+				// 二是放在白名单检测之后——白名单内的 IP 不受封禁影响，配错了阈值还能靠白名单自救。
+				if hitKey, banIP := matchCCBan(hostTarget.Host.Code, weblogbean.NetSrcIp, weblogbean.SRC_IP, hostTarget.Host.IPMode); hitKey != "" {
+					if hostTarget.Host.LogOnlyMode == 1 {
+						// 仅记录模式：只在日志上留痕，不阻断，继续走后续检测
+						weblogbean.LogOnlyMode = 1
+						weblogbean.RULE = "CC封禁"
+					} else {
+						notifyCCBanOnce(hitKey, banIP, region)
+						EchoErrorInfo(w, r, &weblogbean, "", "当前IP由于访问频次太高暂时无法访问", hostTarget, waf.rt().HostTarget[waf.rt().HostCode[global.GWAF_GLOBAL_HOST_CODE]], false, "cc_attack")
+						return
+					}
+				}
+
+				if handleBlock(waf.CheckDenyIP) {
+					return
+				}
+				if handleBlock(waf.CheckDenyURL) {
+					return
+				}
+
+				hostDefense := model.ParseHostsDefense(hostTarget.Host.DEFENSE_JSON)
+
+				//规则判断（规则优先编排：排在黑名单之后、其余检测之前，此时规则的放行动作才能跳过后面的检测）
+				ranRuleCheck := false
+				if global.GCONFIG_RULE_CHAIN_MODE == 1 {
+					if handleBlock(waf.CheckRule) {
+						return
+					}
+					ranRuleCheck = true
+				}
+
+				//检测爬虫bot
+				if hostDefense.DEFENSE_BOT == 1 && !ruleSkip("BOT") {
+					if handleBlock(waf.CheckBot) {
+						return
+					}
+				}
+				//检测sqli
+				if hostDefense.DEFENSE_SQLI == 1 && !ruleSkip("SQLI") {
+					if handleBlock(waf.CheckSql) {
+						return
+					}
+				}
+				//检测xss
+				if hostDefense.DEFENSE_XSS == 1 && !ruleSkip("XSS") {
+					if handleBlock(waf.CheckXss) {
+						return
+					}
+				}
+				//检测扫描工具
+				if hostDefense.DEFENSE_SCAN == 1 && !ruleSkip("SCAN") {
+					if handleBlock(waf.CheckSan) {
+						return
+					}
+				}
+				//检测RCE
+				if hostDefense.DEFENSE_RCE == 1 && !ruleSkip("RCE") {
+					if handleBlock(waf.CheckRce) {
+						return
+					}
+				}
+				//目录穿越检测
+				if hostDefense.DEFENSE_DIR_TRAVERSAL == 1 && !ruleSkip("DIR") {
+					if handleBlock(waf.CheckDirTraversal) {
+						return
+					}
+				}
+				//检测CC
+				if !ruleSkip("CC") {
+					if handleBlock(waf.CheckCC) {
+						return
+					}
+				}
+				//规则判断（默认编排：排在CC之后）
+				if !ranRuleCheck {
+					if handleBlock(waf.CheckRule) {
+						return
+					}
+				}
+				//AI智能检测（全局开关开启且站点开启，规则抓确定的，AI 抓漏网的）
+				if global.GCONFIG_AI_ENABLE == 1 && hostDefense.DEFENSE_AI == 1 && !ruleSkip("AI") {
+					if handleBlock(waf.CheckAI) {
+						return
+					}
+				}
+				//检测敏感词
+				if hostDefense.DEFENSE_SENSITIVE == 1 && !ruleSkip("SENSITIVE") {
+					if handleBlock(waf.CheckSensitive) {
+						return
+					}
+				}
+				//检测OWASP（全局开关或站点级 owaspset 启用时才进入）
+				if (global.GCONFIG_RECORD_ENABLE_OWASP == 1 || hostDefense.DEFENSE_OWASP_SET == 1) && !ruleSkip("OWASP") {
+					if handleBlock(waf.CheckOwasp) {
+						return
+					}
+				}
+
+				// 添加防盗链检查
+				if !ruleSkip("ANTILEECH") {
+					if handleBlock(waf.CheckAntiLeech) {
+						return
+					}
+				}
+
+				// CSRF 跨站请求伪造防护
+				if !ruleSkip("CSRF") {
+					if handleBlock(waf.CheckCsrf) {
+						return
+					}
+				}
+
+				// 文件上传内容检测（multipart 上传的扩展名/Webshell/类型/大小）
+				if !ruleSkip("UPLOAD") {
+					if handleBlock(waf.CheckUpload) {
+						return
+					}
+				}
+
+				// 验证码检测
+				captchaConfig := model.ParseCaptchaConfig(hostTarget.Host.CaptchaJSON)
+
+				// CC 规则的「人机验证」动作也从这里出闸：命中后该客户端被标记为需要验证，
+				// 于是即便站点没有常开验证码，也会走同一套挑战与放行凭证——
+				// 通过一次之后同一页面的子请求带着凭证直接过，不会被反复挑战。
+				ccCaptchaIP := model.GetClientIPByMode(hostTarget.Host.IPMode, weblogbean.NetSrcIp, weblogbean.SRC_IP)
+				ccNeedCaptcha := IsCCCaptchaRequired(hostTarget.Host.Code, ccCaptchaIP)
+				if (captchaConfig.IsEnableCaptcha == 1 || ccNeedCaptcha) && !ruleSkip("CAPTCHA") {
+					// 被 CC 规则要求验证的客户端带着有效凭证过来了，说明这一轮挑战已经完成：
+					// 把"需验证"换成同等长度的免挑战期。免挑战期一过再超阈值会重新挑战，
+					// 所以这个动作是可重复的关卡。
+					if ccNeedCaptcha && hasCaptchaPass(r, ccCaptchaIP) {
+						GrantCCCaptchaGrace(hostTarget.Host.Code, ccCaptchaIP)
+					}
+					if !waf.checkCaptchaToken(r, weblogbean, captchaConfig, hostTarget.Host.IPMode) {
+						// 检查当前URL是否在排除列表中
+						currentURL := strings.ToLower(r.URL.Path)
+						isExcluded := false
+
+						// 获取验证码路径前缀
+						captchaPathPrefix := captchaConfig.PathPrefix
+						if captchaPathPrefix == "" {
+							captchaPathPrefix = "/samwaf_captcha"
+						}
+
+						// 检查是否是验证码相关路径，如果是则直接处理
+						if strings.HasPrefix(currentURL, captchaPathPrefix+"/") || currentURL == captchaPathPrefix {
+							waf.handleCaptchaRequest(w, r, &weblogbean, captchaConfig, captchaPathPrefix, hostTarget.Host.IPMode)
+							return
+						}
+
+						if len(captchaConfig.ExcludeURLs) > 0 {
+							// 将换行分隔的URL列表拆分为数组
+							excludeURLs := strings.Split(string(captchaConfig.ExcludeURLs), "\n")
+							for _, excludeURL := range excludeURLs {
+								// 去除可能的空白字符并转为小写
+								excludeURL = strings.TrimSpace(strings.ToLower(excludeURL))
+								if excludeURL != "" && strings.HasPrefix(currentURL, excludeURL) {
+									isExcluded = true
+									break
+								}
+							}
+						}
+						if isExcluded && ccNeedCaptcha {
+							// 命中验证码的「排除URL」，本次不发起挑战。
+							// CC 规则的人机验证动作复用同一个闸门，所以这条排除会连它一起挡掉。
+							// 必须写进日志：否则界面上只看得到「触发了人机验证」却没有挑战页，无从排查。
+							weblogbean.RULE = weblogbean.RULE + " / 命中验证码排除URL，本次未挑战"
+						}
+						if !isExcluded {
+							// 记下这次验证是谁要求的。闸门本身不知道触发来源，
+							// 不写下来的话，日志里只有「显示图形验证码」，查不出是哪条规则要求的。
+							if ccNeedCaptcha {
+								if src := CaptchaRequireSource(hostTarget.Host.Code, ccCaptchaIP); src != "" {
+									weblogbean.RULE = weblogbean.RULE + " / 人机验证来源:" + src
+								}
+							}
+							waf.handleCaptchaRequest(w, r, &weblogbean, captchaConfig, captchaPathPrefix, hostTarget.Host.IPMode)
+							return
+						}
+					}
+				}
+			}
+
+		}
+
+		// ── 统一访问认证(Access 模式) ──
+		// 位置是被四个约束同时钉死的，挪动前请确认都还成立：
+		//   1. 必须早于下面的 web 缓存与静态站点服务，否则未认证的人能直接拿到缓存正文/本地文件
+		//   2. 必须在 GUARD_STATUS 判定块之外——"关闭防御"关的是攻击检测，不该把访问控制一起关掉
+		//   3. 必须晚于自动跳 HTTPS(上方)，先跳到 https 再种 Cookie，Secure 属性才有意义
+		//   4. 必须晚于 CC 封禁与环路检测，别把登录页发给已被封禁的 IP
+		// 同理它显式不看 LogOnlyMode：仅记录模式是给攻击检测用的，
+		// 把访问控制静默降级成"只记录不拦截"会让用户以为站点受保护、实际却是敞开的。
+		if waf.DoAccessGate(w, r, hostTarget, &weblogbean, clientIP) == accessHandled {
+			return
+		}
+
+		if cacheConfig.IsEnableCache == 1 && !strings.HasPrefix(weblogbean.URL, global.GSSL_HTTP_CHANGLE_PATH) {
+			cacheResp := wafwebcache.LoadWebDataFormCache(w, r, hostTarget, cacheConfig, &weblogbean)
+			if cacheResp != nil {
+				// 将缓存的响应写回给客户端
+				for k, v := range cacheResp.Header {
+					for _, val := range v {
+						w.Header().Add(k, val)
+					}
+				}
+
+				w.Header().Add("X-Cache", "HIT")
+				w.WriteHeader(cacheResp.StatusCode)
+				// 读取并写入响应体
+				if cacheResp.Body != nil {
+					body, _ := ioutil.ReadAll(cacheResp.Body)
+					cacheResp.Body.Close()
+					w.Write(body)
+
+					// 重新创建一个body供后续使用
+					cacheResp.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+				}
+
+				// 设置响应并返回
+				r.Response = cacheResp
+				return
+			}
+		}
+		// 如果开启了静态站点服务且请求路径匹配前缀
+		if staticSiteConfig.IsEnableStaticSite == 1 {
+
+			if strings.HasPrefix(weblogbean.URL, global.GSSL_HTTP_CHANGLE_PATH) {
+				// ACME 校验：命中的情况已经由前面的快速通道处理并返回了，
+				// 走到这里说明本地没有这个挑战文件。静态站点没有后端可回源，明确回 404：
+				//   - 不能交给 serveStaticFile，否则 CA 拿到的是站点自己的 404 页面
+				//   - 更不能像老实现那样什么都不写就 return（等于空 body 的 200），
+				//     CA 会报 "key authorization mismatch"，比 404 更难查
+				http.Error(w, "404 page not found", http.StatusNotFound)
+				weblogbean.ACTION = "放行"
+				weblogbean.STATUS = http.StatusText(http.StatusNotFound)
+				weblogbean.STATUS_CODE = http.StatusNotFound
+				weblogbean.TASK_FLAG = 1
+				global.GQEQUE_LOG_DB.Enqueue(&weblogbean)
+				warnACMEChallenge(weblogbean.HOST, weblogbean.HOST_CODE, weblogbean.URL, "", "", 0,
+					"静态站点模式下本地无对应的校验文件",
+					"核对证书是否就在本站点(站点编码)发起；确认申请时该目录下已生成文件")
+				return
+			} else {
+				waf.serveStaticFile(w, r, staticSiteConfig, &weblogbean, hostTarget)
+				return
+			}
+		}
+		//如果正常的流量不记录请求原始包
+		if global.GCONFIG_RECORD_ALL_SRC_BYTE_INFO == 0 {
+			weblogbean.SrcByteBody = nil
+		}
+		//基本验证是否开关是否开启
+		if hostTarget.Host.IsEnableHttpAuthBase == 1 {
+			bHttpAuthBaseResult, sHttpAuthBaseResult := waf.DoHttpAuthBase(hostTarget, w, r, model.GetClientIPByMode(hostTarget.Host.IPMode, weblogbean.NetSrcIp, weblogbean.SRC_IP))
+			if bHttpAuthBaseResult == true {
+				// 记录日志
+				weblogbean.RES_BODY = sHttpAuthBaseResult
+				weblogbean.ACTION = "禁止"
+				global.GQEQUE_LOG_DB.Enqueue(&weblogbean)
+				return
+			}
+		}
+
+		// 日志保存时候也是脱敏保存防止，数据库密码被破解，遭到敏感信息遭到泄露
+		if global.GCONFIG_RECORD_LOG_DESENSITIZE == 1 && weblogbean.BODY != "" {
+			weblogbean.BODY = utils.DeSenTextByCustomMark(enums.DLP_MARK_RULE_LoginSensitiveInfoMaskRule, weblogbean.BODY)
+		}
+		remoteUrl, err := url.Parse(hostTarget.TargetHost)
+		if err != nil {
+			zlog.Debug("target parse fail:", zap.Any("", err))
+			return
+		}
+
+		// 记录前置校验耗时
+		weblogbean.PreCheckCost = time.Now().UnixNano()/1e6 - weblogbean.UNIX_ADD_TIME
+
+		// 在请求上下文中存储自定义数据
+		ctx := context.WithValue(r.Context(), "waf_context", innerbean.WafHttpContextData{
+			Weblog:   &weblogbean,
+			HostCode: hostCode,
+		})
+
+		// 路径规则匹配（类 nginx location）
+		if len(hostTarget.PathRules) > 0 {
+			if pathRule := MatchPathRule(hostTarget.PathRules, r.URL.Path); pathRule != nil {
+				switch pathRule.TargetType {
+				case 2: // 静态文件
+					waf.ServeStaticFiles(w, r, pathRule, &weblogbean, hostTarget)
+					return
+				case 3: // 重定向
+					code := pathRule.RedirectCode
+					if code != 301 && code != 302 {
+						code = 302
+					}
+					http.Redirect(w, r, pathRule.RedirectURL, code)
+					return
+				default: // case 1: 后端代理
+					waf.ProxyHTTPWithPathRule(w, r, host, pathRule, clientIP, ctx, &weblogbean, hostTarget)
+					return
+				}
+			}
+		}
+
+		// 代理请求
+		waf.ProxyHTTP(w, r, host, remoteUrl, clientIP, ctx, &weblogbean, hostTarget)
+
+		return
+	} else {
+		w.WriteHeader(403)
+		resBytes := []byte("403: Host forbidden " + host)
+		_, err := w.Write(resBytes)
+		if err != nil {
+			zlog.Debug("write fail:", zap.Any("", err))
+			return
+		}
+		// 获取请求报文的内容长度（chunked 时 Go 给 -1，先归一，避免统计出现负数）
+		contentLength := sanitizeContentLength(r.ContentLength)
+
+		//server_online[8081].Svr.Close()
+		var bodyByte []byte
+
+		// 拷贝一份request的Body ,控制不记录大文件的情况 ，先写死的
+		if r.Body != nil && r.Body != http.NoBody && contentLength < (global.GCONFIG_RECORD_MAX_BODY_LENGTH) {
+			bodyByte, _ = io.ReadAll(r.Body)
+			// 把刚刚读出来的再写进去，不然后面解析表单数据就解析不到了
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyByte))
+		}
+		cookies, _ := json.Marshal(r.Cookies())
+		header, _ := json.Marshal(r.Header)
+		// 取出客户IP
+		ipErr, clientIP, clientPort := waf.getClientIP(r, strings.Split(global.GCONFIG_RECORD_PROXY_HEADER, ",")...)
+		if ipErr != nil {
+			zlog.Error("get client error", ipErr.Error())
+			return
+		}
+		region := utils.GetCountry(clientIP)
+		datetimeNow := time.Now()
+
+		currentDay, _ := strconv.Atoi(datetimeNow.Format("20060102"))
+		weblogbean := innerbean.WebLog{
+			HOST:                 r.Host,
+			URL:                  r.RequestURI,
+			REFERER:              r.Referer(),
+			USER_AGENT:           r.UserAgent(),
+			METHOD:               r.Method,
+			HEADER:               string(header),
+			COUNTRY:              region[0],
+			PROVINCE:             region[2],
+			CITY:                 region[3],
+			SRC_IP:               clientIP,
+			SRC_PORT:             clientPort,
+			CREATE_TIME:          datetimeNow.Format("2006-01-02 15:04:05"),
+			UNIX_ADD_TIME:        datetimeNow.UnixNano() / 1e6,
+			CONTENT_LENGTH:       contentLength,
+			COOKIES:              string(cookies),
+			BODY:                 string(bodyByte),
+			REQ_UUID:             uuid.GenUUID(),
+			USER_CODE:            global.GWAF_USER_CODE,
+			HOST_CODE:            "",
+			TenantId:             global.GWAF_TENANT_ID,
+			RULE:                 "",
+			ACTION:               "通过",
+			Day:                  currentDay,
+			STATUS:               "禁止访问",
+			STATUS_CODE:          403,
+			TASK_FLAG:            1,
+			RISK_LEVEL:           1,       //危险等级
+			GUEST_IDENTIFICATION: "未解析域名", //访客身份识别
+			TimeSpent:            0,
+			NetSrcIp:             utils.GetSourceClientIP(r.RemoteAddr),
+			WebLogVersion:        global.GWEBLOG_VERSION,
+			Scheme:               r.Proto,
+			SrcURL:               []byte(r.RequestURI),
+		}
+
+		//记录响应body
+		weblogbean.RES_BODY = string(resBytes)
+		weblogbean.ACTION = "禁止"
+		global.GQEQUE_LOG_DB.Enqueue(&weblogbean)
+	}
+}
+func (waf *WafEngine) getClientIP(r *http.Request, headers ...string) (error, string, string) {
+	for _, header := range headers {
+		ip := r.Header.Get(header)
+		if ip != "" {
+			// 处理可能的多个 IP 地址，以逗号分隔，取第一个有效的
+			ips := strings.Split(ip, ",")
+			trimmedIP := strings.TrimSpace(ips[0])
+			if utils.IsValidIPv4(trimmedIP) {
+				return nil, trimmedIP, "0"
+			}
+			if utils.IsValidIPv6(trimmedIP) {
+				return nil, trimmedIP, "0"
+			}
+			return errors.New("invalid IP address from header: " + header + " value:" + ip), "", ""
+		}
+	}
+
+	// 如果没有找到，使用 r.RemoteAddr
+	ip, port, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return err, "", ""
+	}
+
+	// 验证 IPv4 地址
+	if utils.IsValidIPv4(ip) {
+		return nil, ip, port
+	}
+
+	// 如果是 IPv6 地址，进一步检查是否是有效的 IPv6 地址
+	if strings.Contains(ip, ":") {
+		// 如果是 IPv6 地址，进一步检查是否是有效的 IPv6 地址
+		if strings.Contains(ip, ":") {
+			if utils.IsValidIPv6(ip) {
+				return nil, ip, port
+			} else {
+				return errors.New("invalid IPv6 address from RemoteAddr: " + ip), "", ""
+			}
+		}
+	}
+
+	return errors.New("invalid IP address (not IPv4 or IPv6): " + ip), "", ""
+}
+
+// classifyProxyError 根据 ReverseProxy 回调的错误以及请求上下文判断错误来源
+// 返回：
+//
+//	category   - 用于日志分类的字符串标签
+//	statusCode - 建议写入 weblog 的状态码（仿 nginx：客户端取消使用 499）
+//	statusText - weblog STATUS 字段文案
+//	isClient   - 是否属于客户端主动取消 / 断开，用于调整日志等级
+func classifyProxyError(err error, ctxErr error) (category string, statusCode int, statusText string, isClient bool) {
+	switch {
+	case errors.Is(err, context.Canceled) || errors.Is(ctxErr, context.Canceled):
+		return "client_canceled", 499, "Client Closed Request", true
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctxErr, context.DeadlineExceeded):
+		return "timeout", 504, "Gateway Timeout", false
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		return "backend_eof", 502, "Bad Gateway", false
+	}
+	// net 包内部超时（如 dial i/o timeout、ResponseHeaderTimeout 的旧路径）
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout", 504, "Gateway Timeout", false
+	}
+	return "backend_error", 503, "Service Unavailable", false
+}
+
+func (waf *WafEngine) errorResponse() func(http.ResponseWriter, *http.Request, error) {
+	return func(w http.ResponseWriter, req *http.Request, err error) {
+
+		if wafHttpContext, ok := req.Context().Value("waf_context").(innerbean.WafHttpContextData); ok {
+			weblogReq := wafHttpContext.Weblog
+
+			ctxErr := req.Context().Err()
+			category, statusCode, statusText, isClient := classifyProxyError(err, ctxErr)
+
+			requestInfo := fmt.Sprintf("Method: %s \r\nURL: %s   \r\nHeaders: %v", req.Method, req.URL.String(), req.Header)
+
+			// 统一组织诊断字段，方便区分"客户端取消 vs 后端故障 vs 超时"
+			ctxErrStr := "<nil>"
+			if ctxErr != nil {
+				ctxErrStr = ctxErr.Error()
+			}
+			if isClient {
+				// 客户端自己断开不是错误，降级为 Info，避免刷屏
+				zlog.Info("反向代理客户端已断开",
+					zap.String("category", category),
+					zap.String("err", err.Error()),
+					zap.String("ctx_err", ctxErrStr),
+					zap.Bool("is_context_canceled", errors.Is(err, context.Canceled)),
+					zap.Bool("is_deadline_exceeded", errors.Is(err, context.DeadlineExceeded)),
+					zap.Bool("ctx_is_canceled", errors.Is(ctxErr, context.Canceled)),
+					zap.Bool("ctx_is_deadline", errors.Is(ctxErr, context.DeadlineExceeded)),
+					zap.Int("status_code", statusCode),
+					zap.String("request_info", requestInfo),
+				)
+			} else {
+				zlog.Error("反向代理后端错误",
+					zap.String("category", category),
+					zap.String("err", err.Error()),
+					zap.String("ctx_err", ctxErrStr),
+					zap.Bool("is_context_canceled", errors.Is(err, context.Canceled)),
+					zap.Bool("is_deadline_exceeded", errors.Is(err, context.DeadlineExceeded)),
+					zap.Bool("ctx_is_canceled", errors.Is(ctxErr, context.Canceled)),
+					zap.Bool("ctx_is_deadline", errors.Is(ctxErr, context.DeadlineExceeded)),
+					zap.Int("status_code", statusCode),
+					zap.String("request_info", requestInfo),
+				)
+			}
+
+			resBytes := []byte("<html><head><title>服务不可用</title></head><body><center><h1>服务不可用</h1> <br><h3></h3></center></body> </html>")
+
+			//记录响应Header信息
+			resHeader := ""
+			if req.Response != nil {
+				resHeader = joinHeader(req.Response.Header)
+			}
+
+			weblogReq.ResHeader = resHeader
+			if isClient {
+				weblogReq.ACTION = "客户端断开"
+			} else {
+				weblogReq.ACTION = "放行"
+			}
+			weblogReq.STATUS = statusText
+			weblogReq.STATUS_CODE = statusCode
+			weblogReq.RES_BODY = fmt.Sprintf("类型:%s \r\n请求相关信息:%v \r\n 错误信息:%v \r\n ctxErr:%v \r\n", category, requestInfo, err.Error(), ctxErr)
+			weblogReq.TASK_FLAG = 1
+			if global.GQEQUE_LOG_DB != nil {
+				global.GQEQUE_LOG_DB.Enqueue(weblogReq)
+			}
+
+			// 客户端已断开时再写响应通常也写不出去，但仍保持原有写入行为，只是降级日志
+			w.WriteHeader(statusCode)
+			if _, writeErr := w.Write(resBytes); writeErr != nil {
+				zlog.Debug("write fail:", zap.Any("err", writeErr))
+				return
+			}
+		}
+
+		return
+	}
+}
+func (waf *WafEngine) modifyResponse() func(*http.Response) error {
+	return func(resp *http.Response) error {
+		resp.Header.Set("X-Xss-Protection", "1; mode=block")
+		if global.GCONFIG_RECORD_HIDE_SERVER_HEADER == 1 {
+			resp.Header.Del("Server")
+			resp.Header.Del("X-Powered-By")
+		}
+		r := resp.Request
+
+		// 应用自定义响应头信息（支持多规则路径匹配）
+		if wafCtx, ok := r.Context().Value("waf_context").(innerbean.WafHttpContextData); ok {
+			host := waf.rt().HostCode[wafCtx.HostCode]
+			if hostTarget, exists := waf.rt().HostTarget[host]; exists {
+				customResponseHeadersConfig := model.ParseCustomResponseHeadersConfig(hostTarget.Host.CustomResponseHeadersJSON)
+				if customResponseHeadersConfig.IsEnableCustomHeaders == 1 && len(customResponseHeadersConfig.Rules) > 0 {
+					clientIP := r.RemoteAddr
+					if idx := strings.LastIndex(clientIP, ":"); idx != -1 {
+						clientIP = clientIP[:idx]
+					}
+					finalHeaders := waf.applyCustomResponseHeaders(customResponseHeadersConfig.Rules, r, clientIP)
+					for name, value := range finalHeaders {
+						resp.Header.Set(name, value)
+					}
+				}
+			}
+		}
+
+		// Cookie 安全保护：缺失才补 HttpOnly/Secure/SameSite（按站点配置）
+		if wafCtx, ok := r.Context().Value("waf_context").(innerbean.WafHttpContextData); ok {
+			host := waf.rt().HostCode[wafCtx.HostCode]
+			if hostTarget, exists := waf.rt().HostTarget[host]; exists {
+				cookieCfg := model.ParseCookieSecurityConfig(hostTarget.Host.CookieSecurityJSON)
+				if cookieCfg.IsEnable == 1 {
+					if lines := resp.Header.Values("Set-Cookie"); len(lines) > 0 {
+						isHTTPS := r.TLS != nil
+						secured := make([]string, 0, len(lines))
+						for _, l := range lines {
+							secured = append(secured, secureSetCookie(l, isHTTPS, cookieCfg))
+						}
+						resp.Header.Del("Set-Cookie")
+						for _, l := range secured {
+							resp.Header.Add("Set-Cookie", l)
+						}
+					}
+				}
+			}
+		}
+
+		// 检查是否为WebSocket协议切换
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+
+			if wafHttpContext, ok := r.Context().Value("waf_context").(innerbean.WafHttpContextData); ok {
+				weblogfrist := wafHttpContext.Weblog
+				host := waf.rt().HostCode[wafHttpContext.HostCode]
+				weblogfrist.ACTION = "放行"
+				weblogfrist.STATUS = resp.Status
+				weblogfrist.STATUS_CODE = resp.StatusCode
+				weblogfrist.RES_CONTENT_LENGTH = sanitizeContentLength(resp.ContentLength)
+
+				resHeader := joinHeader(resp.Header)
+				weblogfrist.ResHeader = resHeader
+
+				datetimeNow := time.Now()
+				weblogfrist.TimeSpent = datetimeNow.UnixNano()/1e6 - weblogfrist.UNIX_ADD_TIME
+				weblogfrist.TASK_FLAG = 1
+
+				// 记录日志
+				if shouldRecordWebLog(weblogfrist, waf.rt().HostTarget[host]) {
+					global.GQEQUE_LOG_DB.Enqueue(weblogfrist)
+				}
+			}
+			// 对于WebSocket连接，不修改响应体，直接返回
+			return nil
+		}
+		if wafHttpContext, ok := r.Context().Value("waf_context").(innerbean.WafHttpContextData); ok {
+
+			backendCheckStart := time.Now().UnixNano() / 1e6
+
+			weblogfrist := wafHttpContext.Weblog
+
+			host := waf.rt().HostCode[wafHttpContext.HostCode]
+
+			// 记录后端真实返回的状态码
+			backendStatusCode := resp.StatusCode
+			backendStatus := resp.Status
+
+			weblogfrist.ACTION = "放行"
+			weblogfrist.STATUS = resp.Status
+			weblogfrist.STATUS_CODE = resp.StatusCode
+			// 上游 chunked 传输时 resp.ContentLength 为 -1，先按 0 计；非静态资源后续会用真实落盘字节数回填
+			weblogfrist.RES_CONTENT_LENGTH = sanitizeContentLength(resp.ContentLength)
+
+			// 响应缓冲关闭（IsEnableResponseBuffering==0，类似 nginx proxy_buffering off）：不读响应体，避免整包缓冲，配合 FlushInterval=-1 边收边推。
+			// 因此关闭缓冲时，依赖读体的能力（敏感词/响应压缩/防篡改/响应缓存等）对本请求不生效。
+			// ACME 证书校验路径除外，避免签发/续期被短路干扰（与缓存等逻辑一致）。
+			if hostTarget, exists := waf.rt().HostTarget[host]; exists &&
+				hostTarget.Host.IsEnableResponseBuffering == 0 &&
+				!strings.HasPrefix(weblogfrist.URL, global.GSSL_HTTP_CHANGLE_PATH) {
+				weblogfrist.TASK_FLAG = 1
+				resHeader := joinHeader(resp.Header)
+				weblogfrist.ResHeader = resHeader
+				datetimeNow := time.Now()
+				weblogfrist.TimeSpent = datetimeNow.UnixNano()/1e6 - weblogfrist.UNIX_ADD_TIME
+				weblogfrist.BackendCheckCost = datetimeNow.UnixNano()/1e6 - backendCheckStart
+				if shouldRecordWebLog(weblogfrist, hostTarget) {
+					global.GQEQUE_LOG_DB.Enqueue(weblogfrist)
+				}
+				return nil
+			}
+
+			// 网页防篡改：反代响应基线比对（命中且 replace 动作则回吐正确副本并短路）
+			if waf.checkAndHandleTamper(resp, r, host, weblogfrist) {
+				weblogfrist.BackendCheckCost = time.Now().UnixNano()/1e6 - backendCheckStart
+				return nil
+			}
+
+			//返回内容的类型
+			respContentType := strings.ToLower(resp.Header.Get("Content-Type"))
+			respContentType = strings.Replace(respContentType, "; charset=utf-8", "", -1)
+			respContentType = strings.Replace(respContentType, "; charset=gbk", "", -1)
+
+			//记录静态日志
+			isStaticAssist := utils.IsStaticAssist(resp, respContentType)
+
+			// 检查是否为流式内容
+			contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+			isStreamContent := strings.Contains(contentType, "text/event-stream") ||
+				strings.Contains(contentType, "application/stream+json")
+
+			compressCfg := model.ParseResponseCompressConfig(waf.rt().HostTarget[host].Host.ResponseCompressJSON)
+
+			//记录响应body
+			if !isStaticAssist && resp.Body != nil && resp.Body != http.NoBody {
+
+				// 如果是流式内容，使用流式处理器
+				if isStreamContent {
+					// 创建流式处理器包装原始响应体
+					resp.Body = waf.createStreamProcessor(resp.Body, wafHttpContext, host)
+
+					// 对于流式内容，跳过后续的常规处理逻辑
+					// 但仍然记录基本的访问日志
+					weblogfrist.ACTION = "放行"
+					weblogfrist.STATUS = resp.Status
+					weblogfrist.STATUS_CODE = resp.StatusCode
+					weblogfrist.TASK_FLAG = 1
+
+					// 记录响应Header信息
+					resHeader := joinHeader(resp.Header)
+					weblogfrist.ResHeader = resHeader
+
+					datetimeNow := time.Now()
+					weblogfrist.TimeSpent = datetimeNow.UnixNano()/1e6 - weblogfrist.UNIX_ADD_TIME
+					weblogfrist.BackendCheckCost = time.Now().UnixNano()/1e6 - backendCheckStart //响应数据处理时间
+
+					// 记录流式访问日志
+					if shouldRecordWebLog(weblogfrist, waf.rt().HostTarget[host]) {
+						global.GQEQUE_LOG_DB.Enqueue(weblogfrist)
+					}
+
+					return nil
+				}
+
+				ldpFlag := false
+				// 将请求URL转为小写，用于不区分大小写的比较
+				lowerRequestURI := strings.ToLower(resp.Request.RequestURI)
+
+				//隐私保护（局部）
+				for i := 0; i < len(waf.rt().HostTarget[host].LdpUrlLists); i++ {
+					// 将规则URL也转为小写
+					lowerRuleURL := strings.ToLower(waf.rt().HostTarget[host].LdpUrlLists[i].Url)
+
+					if (waf.rt().HostTarget[host].LdpUrlLists[i].CompareType == "等于" && lowerRuleURL == lowerRequestURI) ||
+						(waf.rt().HostTarget[host].LdpUrlLists[i].CompareType == "前缀匹配" && strings.HasPrefix(lowerRequestURI, lowerRuleURL)) ||
+						(waf.rt().HostTarget[host].LdpUrlLists[i].CompareType == "后缀匹配" && strings.HasSuffix(lowerRequestURI, lowerRuleURL)) ||
+						(waf.rt().HostTarget[host].LdpUrlLists[i].CompareType == "包含匹配" && strings.Contains(lowerRequestURI, lowerRuleURL)) {
+
+						ldpFlag = true
+						break
+					}
+				}
+				//隐私保护（全局）
+				for i := 0; i < len(waf.rt().HostTarget[global.GWAF_GLOBAL_HOST_NAME].LdpUrlLists); i++ {
+					// 将全局规则URL也转为小写
+					lowerGlobalRuleURL := strings.ToLower(waf.rt().HostTarget[global.GWAF_GLOBAL_HOST_NAME].LdpUrlLists[i].Url)
+
+					if (waf.rt().HostTarget[global.GWAF_GLOBAL_HOST_NAME].LdpUrlLists[i].CompareType == "等于" && lowerGlobalRuleURL == lowerRequestURI) ||
+						(waf.rt().HostTarget[global.GWAF_GLOBAL_HOST_NAME].LdpUrlLists[i].CompareType == "前缀匹配" && strings.HasPrefix(lowerRequestURI, lowerGlobalRuleURL)) ||
+						(waf.rt().HostTarget[global.GWAF_GLOBAL_HOST_NAME].LdpUrlLists[i].CompareType == "后缀匹配" && strings.HasSuffix(lowerRequestURI, lowerGlobalRuleURL)) ||
+						(waf.rt().HostTarget[global.GWAF_GLOBAL_HOST_NAME].LdpUrlLists[i].CompareType == "包含匹配" && strings.Contains(lowerRequestURI, lowerGlobalRuleURL)) {
+
+						ldpFlag = true
+						break
+					}
+				}
+				if ldpFlag == true {
+					orgContentBytes, charsetName, responseEncodingError := waf.getOrgContent(resp, isStaticAssist, waf.rt().HostTarget[host].Host.DefaultEncoding)
+					if responseEncodingError == nil {
+						newPayload := []byte("" + utils.DeSenText(string(orgContentBytes)))
+						finalCompressBytes, _ := waf.compressContent(resp, isStaticAssist, newPayload, charsetName)
+						finalCompressBytes = waf.maybeApplyResponseCompress(r, resp, finalCompressBytes, compressCfg)
+
+						resp.Body = io.NopCloser(bytes.NewBuffer(finalCompressBytes))
+						// head 修改追加内容
+						resp.ContentLength = int64(len(finalCompressBytes))
+						resp.Header.Set("Content-Length", strconv.FormatInt(int64(len(finalCompressBytes)), 10))
+					} else {
+						resp.Body = io.NopCloser(bytes.NewBuffer(orgContentBytes))
+						zlog.Warn(fmt.Sprintf("识别响应内容编码失败，隐私防护不可用 %v，请求URL: %s ,可以在主机其他设置里面设置默认编码", responseEncodingError, r.URL.String()))
+					}
+
+				}
+				//编码转换，自动检测网页编码   resp *http.Response
+				orgContentBytes, charsetName, responseEncodingError := waf.getOrgContent(resp, isStaticAssist, waf.rt().HostTarget[host].Host.DefaultEncoding)
+				if responseEncodingError == nil {
+					if global.GCONFIG_RECORD_RESP == 1 {
+						if resp.ContentLength < global.GCONFIG_RECORD_MAX_RES_BODY_LENGTH {
+							weblogfrist.RES_BODY = string(orgContentBytes)
+							weblogfrist.SrcByteResBody = orgContentBytes
+						}
+					}
+
+					//处理敏感词
+					if waf.CheckResponseSensitive() {
+						matchBodyResult := waf.SensitiveManager.MultiPatternSearch([]rune(string(orgContentBytes)), false)
+						if len(matchBodyResult) > 0 {
+							sensitive := matchBodyResult[0].CustomData.(model.Sensitive)
+
+							if sensitive.CheckDirection != "in" {
+								weblogfrist.RISK_LEVEL = 1
+								if sensitive.Action == "deny" {
+									if waf.rt().HostTarget[host].Host.LogOnlyMode == 1 {
+										// 仅记录模式：记录攻击日志但不阻断请求
+										weblogfrist.LogOnlyMode = 1
+										weblogfrist.GUEST_IDENTIFICATION = "触发敏感词"
+										weblogfrist.RULE = "敏感词检测：" + string(matchBodyResult[0].Word)
+
+									} else {
+										EchoResponseErrorInfo(resp, weblogfrist, "敏感词检测："+string(matchBodyResult[0].Word), "敏感词内容", waf.rt().HostTarget[host], waf.rt().HostTarget[waf.rt().HostCode[global.GWAF_GLOBAL_HOST_CODE]], true, "sensitive_word")
+										return nil
+									}
+								} else {
+									words := processSensitiveWords(matchBodyResult, "in")
+									weblogfrist.GUEST_IDENTIFICATION = "触发敏感词"
+									weblogfrist.RULE = "敏感词检测：" + strings.Join(words, ",")
+									for _, word := range words {
+										orgContentBytes = bytes.ReplaceAll(orgContentBytes, []byte(word), []byte(global.GWAF_HTTP_SENSITIVE_REPLACE_STRING))
+
+									}
+								}
+							}
+						}
+					}
+					//将数据在回写上去
+					finalCompressBytes, _ := waf.compressContent(resp, isStaticAssist, orgContentBytes, charsetName)
+					finalCompressBytes = waf.maybeApplyResponseCompress(r, resp, finalCompressBytes, compressCfg)
+					resp.Body = io.NopCloser(bytes.NewBuffer(finalCompressBytes))
+					resp.ContentLength = int64(len(finalCompressBytes))
+					resp.Header.Set("Content-Length", strconv.FormatInt(int64(len(finalCompressBytes)), 10))
+					// body 已被完整读取并重写，用真实字节数回填出站流量，修正 chunked 场景下的 -1
+					weblogfrist.RES_CONTENT_LENGTH = int64(len(finalCompressBytes))
+
+				} else {
+					resp.Body = io.NopCloser(bytes.NewBuffer(orgContentBytes))
+					zlog.Warn(fmt.Sprintf("识别响应内容编码失败，响应日志，敏感词替换 不可用 %v，请求URL: %s ,可以在主机其他设置里面设置默认编码", responseEncodingError, r.URL.String()))
+				}
+			} else if isStaticAssist && !isStreamContent && resp.Body != nil && resp.Body != http.NoBody {
+				waf.maybeCompressStaticAssistResponse(r, resp, compressCfg)
+			}
+
+			//检测cache
+			cacheConfig := model.CacheConfig{
+				IsEnableCache:   0,
+				CacheLocation:   "",
+				CacheDir:        "",
+				MaxFileSizeMB:   0,
+				MaxMemorySizeMB: 0,
+			}
+			err := json.Unmarshal([]byte(waf.rt().HostTarget[host].Host.CacheJSON), &cacheConfig)
+			if err != nil {
+				zlog.Debug("解析cache json失败")
+			}
+			if cacheConfig.IsEnableCache == 1 && !strings.HasPrefix(weblogfrist.URL, global.GSSL_HTTP_CHANGLE_PATH) {
+				wafwebcache.StoreWebDataCache(resp, waf.rt().HostTarget[host], cacheConfig, weblogfrist)
+			}
+
+			// ACME 证书校验必须与 isStaticAssist 判定并列，不能嵌套在它内部：
+			// "是不是静态资源"和"是不是证书校验路径"毫不相干，而后端只要回一个带
+			// Accept-Ranges: bytes 的响应（IIS、Apache 指向静态文件的 ErrorDocument 都会带），
+			// isStaticAssist 就为真，整段兜底连同日志会被一起吞掉，
+			// 表现为"证书签不下来而且日志里什么都没有"——这是线上真实工单的成因。
+			if handleACMEChallengeResponse(resp, weblogfrist, backendCheckStart) {
+				// 已按证书校验的规则处理完毕，不再走下面的常规响应处理
+			} else if !isStaticAssist {
+				datetimeNow := time.Now()
+				weblogfrist.TimeSpent = datetimeNow.UnixNano()/1e6 - weblogfrist.UNIX_ADD_TIME
+
+				// 检查是否需要应用自定义错误页面（非 ACME Challenge 请求）
+				// 注意：这里只针对"后端真实返回的状态码"；WAF 自身的拦截走 EchoErrorInfo，是另一条独立路径。
+				customBlockingPage := resolveCustomErrorPage(
+					waf.rt().HostTarget[host],
+					waf.rt().HostTarget[waf.rt().HostCode[global.GWAF_GLOBAL_HOST_CODE]],
+					backendStatusCode,
+				)
+
+				if customBlockingPage != nil {
+					pageResult := applyCustomErrorPage(resp, customBlockingPage, backendStatusCode, backendStatus, weblogfrist.REQ_UUID)
+
+					if pageResult.TemplateApplied {
+						// 记录响应Header信息
+						resHeader := joinHeader(resp.Header)
+						weblogfrist.ResHeader = resHeader
+
+						// 记录日志信息
+						weblogfrist.ACTION = "放行"
+						weblogfrist.STATUS = resp.Status
+						weblogfrist.STATUS_CODE = resp.StatusCode
+						weblogfrist.RES_BODY = string(pageResult.BackendBody)
+
+						weblogfrist.TASK_FLAG = 1
+						weblogfrist.BackendCheckCost = time.Now().UnixNano()/1e6 - backendCheckStart
+
+						// 记录日志 - 根据配置决定是否记录
+						if shouldRecordWebLog(weblogfrist, waf.rt().HostTarget[host]) {
+							global.GQEQUE_LOG_DB.Enqueue(weblogfrist)
+						}
+
+						// 应用自定义错误页后直接返回
+						return nil
+					}
+					// 「优先后端响应」已把后端内容原样还原，落到下面的常规响应处理
+				}
+
+				//记录响应Header信息
+				resHeader := joinHeader(resp.Header)
+				weblogfrist.ResHeader = resHeader
+				weblogfrist.ACTION = "放行"
+				weblogfrist.STATUS = resp.Status
+				weblogfrist.STATUS_CODE = resp.StatusCode
+				weblogfrist.TASK_FLAG = 1
+				weblogfrist.BackendCheckCost = time.Now().UnixNano()/1e6 - backendCheckStart //响应数据处理时间
+				if shouldRecordWebLog(weblogfrist, waf.rt().HostTarget[host]) {
+					global.GQEQUE_LOG_DB.Enqueue(weblogfrist)
+				}
+
+			}
+		} else {
+			fmt.Println("weblog not found")
+		}
+
+		return nil
+	}
+}
+
+// sanitizeContentLength 规整 http 报文的 ContentLength：
+// Go 在分块传输(chunked)等长度未知场景下会返回 -1，直接用于流量累加会导致出现负数，这里统一按 0 处理。
+func sanitizeContentLength(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func joinHeader(h http.Header) string {
+	var buf strings.Builder
+	blen := 0
+	for key, values := range h {
+		for _, value := range values {
+			blen += len(key) + len(": ") + len(value) + len("\r\n")
+		}
+	}
+	buf.Grow(blen)
+	for key, values := range h {
+		for _, value := range values {
+			buf.WriteString(key)
+			buf.WriteString(": ")
+			buf.WriteString(value)
+			buf.WriteString("\r\n")
+		}
+	}
+	return buf.String()
+}
+
+func (waf *WafEngine) StartWaf() {
+
+	waf.EngineCurrentStatus = 1
+	waf.ensureGlobalHost()
+
+	//初始化步骤[加载ip数据库]
+	// 从嵌入的文件中读取内容
+
+	//global.GCACHE_IP_CBUFF = main.Ip2regionBytes
+
+	//第一步 检测合法性并加入到全局
+	waf.LoadAllHost()
+
+	wafSysLog := model.WafSysLog{
+		BaseOrm: baseorm.BaseOrm{
+			Id:          uuid.GenUUID(),
+			USER_CODE:   global.GWAF_USER_CODE,
+			Tenant_ID:   global.GWAF_TENANT_ID,
+			CREATE_TIME: customtype.JsonTime(time.Now()),
+			UPDATE_TIME: customtype.JsonTime(time.Now()),
+		},
+		OpType:    "信息",
+		OpContent: "WAF启动",
+	}
+	global.GQEQUE_LOG_DB.Enqueue(&wafSysLog)
+
+	waf.StartAllProxyServer()
+}
+
+// ensureGlobalHost 确保全局保护主机存在（首次启动时创建）。
+func (waf *WafEngine) ensureGlobalHost() {
+	var hosts []model.Hosts
+	global.GWAF_LOCAL_DB.Where("global_host = ?", 1).Find(&hosts)
+	if len(hosts) != 0 {
+		return
+	}
+	var wafGlobalHost = &model.Hosts{
+		BaseOrm: baseorm.BaseOrm{
+			USER_CODE:   global.GWAF_USER_CODE,
+			Tenant_ID:   global.GWAF_TENANT_ID,
+			CREATE_TIME: customtype.JsonTime(time.Now()),
+			UPDATE_TIME: customtype.JsonTime(time.Now()),
+		},
+		Code:             uuid.GenUUID(),
+		Host:             "全局网站",
+		Port:             0,
+		Ssl:              0,
+		GUARD_STATUS:     0,
+		REMOTE_SYSTEM:    "",
+		REMOTE_APP:       "",
+		Remote_host:      "",
+		Remote_port:      0,
+		Certfile:         "",
+		Keyfile:          "",
+		REMARKS:          "",
+		GLOBAL_HOST:      1,
+		START_STATUS:     0,
+		UnrestrictedPort: 0,
+		BindSslId:        "",
+		AutoJumpHTTPS:    0,
+	}
+	global.GWAF_LOCAL_DB.Create(wafGlobalHost)
+}
+
+// ReloadAllHostZeroGap 零空档重载全部主机配置（"重启引擎"用，替代 CloseWaf+StartWaf）。
+//
+// 不关闭监听器、不清空路由：而是
+//  1. 逐 host 调 LoadHost(原子替换，主端口 key 全程不缺失，无 403 空档)；
+//  2. 删除已不在 DB 的 host(RemoveHost，仅删该 host 的 key)；
+//  3. 端口差分：StartAllProxyServer 仅起新端口(已在监听的端口 Status==0 被跳过)，RemovePortServer 关已无主机的端口。
+//
+// 业务端口(80/443/自定义)的监听 socket 全程不下线，新连接不会 connection refused。
+func (waf *WafEngine) ReloadAllHostZeroGap() {
+	waf.EngineCurrentStatus = 1
+	waf.ensureGlobalHost()
+
+	// 记录当前路由里的 host（用于删除已不在 DB 的）
+	oldRT := waf.rt()
+	oldHosts := make(map[string]model.Hosts, len(oldRT.HostCode))
+	for code, key := range oldRT.HostCode {
+		if hs := oldRT.HostTarget[key]; hs != nil {
+			oldHosts[code] = hs.Host
+		}
+	}
+
+	// 从 DB 重载每个 host（LoadHost 原子替换，无空档）
+	var dbHosts []model.Hosts
+	global.GWAF_LOCAL_DB.Find(&dbHosts)
+	newCodes := make(map[string]bool, len(dbHosts))
+	for i := range dbHosts {
+		newCodes[dbHosts[i].Code] = true
+		waf.LoadHost(dbHosts[i])
+	}
+
+	// 删除已不在 DB 的 host（仅删其 key，不影响其它 host）
+	for code, oldHost := range oldHosts {
+		if !newCodes[code] {
+			waf.RemoveHost(oldHost)
+		}
+	}
+
+	// 端口差分：起新端口监听 + 关已无主机占用的端口（均不影响在监听的业务端口）
+	waf.StartAllProxyServer()
+	waf.RemovePortServer()
+
+	wafSysLog := model.WafSysLog{
+		BaseOrm: baseorm.BaseOrm{
+			Id:          uuid.GenUUID(),
+			USER_CODE:   global.GWAF_USER_CODE,
+			Tenant_ID:   global.GWAF_TENANT_ID,
+			CREATE_TIME: customtype.JsonTime(time.Now()),
+			UPDATE_TIME: customtype.JsonTime(time.Now()),
+		},
+		OpType:    "信息",
+		OpContent: "WAF零空档重载",
+	}
+	global.GQEQUE_LOG_DB.Enqueue(&wafSysLog)
+}
+
+// CloseWaf 关闭waf
+func (waf *WafEngine) CloseWaf() {
+	defer func() {
+		e := recover()
+		if e != nil { // 捕获该协程的panic 111111
+			zlog.Debug("关闭 recover ", e)
+		}
+	}()
+	wafSysLog := &model.WafSysLog{
+		BaseOrm: baseorm.BaseOrm{
+			Id:          uuid.GenUUID(),
+			USER_CODE:   global.GWAF_USER_CODE,
+			Tenant_ID:   global.GWAF_TENANT_ID,
+			CREATE_TIME: customtype.JsonTime(time.Now()),
+			UPDATE_TIME: customtype.JsonTime(time.Now()),
+		},
+		OpType:    "信息",
+		OpContent: "WAF关闭",
+	}
+	global.GQEQUE_LOG_DB.Enqueue(wafSysLog)
+	waf.EngineCurrentStatus = 0
+
+	waf.StopAllProxyServer()
+	//重置信息：路由快照(RCU)整体替换为空表
+	waf.writeMu.Lock()
+	waf.routing.Store(newRoutingTable())
+	waf.writeMu.Unlock()
+	waf.ServerOnline.Clear()
+	waf.AllCertificate = AllCertificate{
+		Mux: sync.Mutex{},
+		Map: map[string]*tls.Certificate{},
+	}
+	// 清除Transport缓存池
+
+	waf.TransportMux.Lock()
+	waf.TransportPool = map[string]*http.Transport{}
+	defer waf.TransportMux.Unlock()
+
+}
+
+// 清除代理
+func (waf *WafEngine) ClearProxy(hostCode string) {
+	var list []model.LoadBalance
+	global.GWAF_LOCAL_DB.Where("host_code = ? ", hostCode).Find(&list)
+	// 字段级热更新(copy-on-write)：换 LoadBalanceLists；LoadBalanceRuntime 是共享可变子对象，
+	// 在其自身 Mux 下清空，触发下次请求按新后端懒重建(见 proxy.go)。
+	waf.UpdateHost(hostCode, func(h *wafenginmodel.HostSafe) {
+		h.LoadBalanceLists = list
+		h.LoadBalanceRuntime.Mux.Lock()
+		h.LoadBalanceRuntime.RevProxies = []*wafproxy.ReverseProxy{}
+		h.LoadBalanceRuntime.WeightRoundRobinBalance = loadbalance.NewWeightRoundRobinBalance(hostCode)
+		h.LoadBalanceRuntime.IpHashBalance = loadbalance.NewConsistentHashBalance(nil, hostCode)
+		h.LoadBalanceRuntime.Mux.Unlock()
+	})
+}
+
+// 开启所有代理
+func (waf *WafEngine) StartAllProxyServer() {
+
+	waf.ServerOnline.Range(func(port int, v innerbean.ServerRunTime) bool {
+		waf.StartProxyServer(v)
+		return true
+	})
+	waf.EnumAllPortProxyServer()
+
+	// 已在监听的端口 Status==0，StartProxyServer 会直接跳过，所以 http3 开关的变化必须在这里
+	// 单独对齐一次；否则「重启引擎」(ReloadAllHostZeroGap) 也起不来 QUIC(issue #916)。
+	waf.ReconcileHTTP3()
+
+	waf.ReLoadSensitive()
+}
+
+// 罗列端口
+func (waf *WafEngine) EnumAllPortProxyServer() {
+	onlinePorts := ""
+	summary := ""
+	waf.ServerOnline.Range(func(port int, v innerbean.ServerRunTime) bool {
+		onlinePorts = strconv.Itoa(v.Port) + "," + onlinePorts
+		ipv := v.IPVersion
+		if ipv == "" {
+			ipv = utils.ListenIPVBoth
+		}
+		summary = strconv.Itoa(v.Port) + "(" + v.ServerType + "," + ipv + ") " + summary
+		return true
+	})
+	global.GWAF_RUNTIME_CURRENT_WEBPORT = onlinePorts
+	// 端口监听总表：端口(协议,IP版本)，排障时一眼看清全机端口协议分布
+	zlog.Info("当前端口监听总表: " + summary)
+}
+
+// notifyListenFail 监听失败发声：系统日志 + WebSocket。选了仅IPv6而机器无IPv6等场景，
+// 静默 return 会让站点悄悄不通、无从排查。
+func (waf *WafEngine) notifyListenFail(innruntime innerbean.ServerRunTime, cause error) {
+	ipv := innruntime.IPVersion
+	if ipv == "" {
+		ipv = utils.ListenIPVBoth
+	}
+	msg := fmt.Sprintf("端口监听失败: %d 协议:%s IP版本:%s 原因:%s ，请检查端口是否被其他应用占用、IP版本是否与主机网络能力匹配（如选了仅IPv6但机器无IPv6地址）",
+		innruntime.Port, innruntime.ServerType, ipv, cause.Error())
+	zlog.Error(msg)
+	global.GQEQUE_LOG_DB.Enqueue(&model.WafSysLog{
+		BaseOrm: baseorm.BaseOrm{
+			Id:          uuid.GenUUID(),
+			USER_CODE:   global.GWAF_USER_CODE,
+			Tenant_ID:   global.GWAF_TENANT_ID,
+			CREATE_TIME: customtype.JsonTime(time.Now()),
+			UPDATE_TIME: customtype.JsonTime(time.Now()),
+		},
+		OpType:    "系统运行错误",
+		OpContent: msg,
+	})
+	global.GQEQUE_MESSAGE_DB.Enqueue(innerbean.OpResultMessageInfo{
+		BaseMessageInfo: innerbean.BaseMessageInfo{OperaType: "提示信息", Server: global.GWAF_CUSTOM_SERVER_NAME},
+		Msg:             msg,
+		Success:         "false",
+	})
+}
+
+func (waf *WafEngine) StartProxyServer(innruntime innerbean.ServerRunTime) {
+	if innruntime.Status == 0 {
+		//启动完成的就不进这里了
+		return
+	}
+	if innruntime.ServerType == "" {
+		//如果是空的就不进行了
+		return
+	}
+	go func(innruntime innerbean.ServerRunTime) {
+
+		if (innruntime.ServerType) == "https" {
+
+			defer func() {
+				e := recover()
+				if e != nil { // 捕获该协程的panic 111111
+					zlog.Warn("https recover ", e)
+				}
+			}()
+
+			portStr := strconv.Itoa(innruntime.Port)
+			// h3Holder 必须在两个分支之前创建：HTTPS 重定向模式与普通模式都要支持 HTTP/3。
+			// 老代码把 h3 整块放在 else 里，开了 HTTPS 重定向就静默没有 HTTP/3(issue #916)。
+			// 重定向服务器只是个 TCP listener 包装(把 443 上的明文 HTTP 请求 301 走)，与 QUIC 无关，可以共存。
+			h3Holder := &innerbean.H3Holder{}
+
+			var svr *http.Server
+			var redirectServer *wafhttpserver.RedirectingHTTPSServer
+			// 检查是否启用HTTPS重定向服务器
+			if global.GCONFIG_ENABLE_HTTPS_REDIRECT == 1 {
+				// 使用新的重定向服务器
+				redirectServer = &wafhttpserver.RedirectingHTTPSServer{
+					Server: &http.Server{
+						Addr:    ":" + portStr,
+						Handler: waf.altSvcHandler(h3Holder, portStr),
+						TLSConfig: &tls.Config{
+							GetCertificate: waf.GetCertificateFunc,
+							MinVersion:     utils.ParseTLSVersion(global.GCONFIG_RECORD_SSLMinVerson),
+							MaxVersion:     utils.ParseTLSVersion(global.GCONFIG_RECORD_SSLMaxVerson),
+						},
+					},
+				}
+				svr = redirectServer.Server
+			} else {
+				svr = &http.Server{
+					Addr: ":" + portStr,
+					// 固定安装 Alt-Svc 包装处理器：内部按 h3Holder 是否活跃决定要不要加 Alt-Svc，
+					// 这样 http3 开关热生效时无需在运行期改写 Handler(会与在途请求竞态)。
+					Handler: waf.altSvcHandler(h3Holder, portStr),
+					TLSConfig: &tls.Config{
+						GetCertificate: waf.GetCertificateFunc,
+						// 按 SNI 逐连接定制 ALPN，实现 per-host 的对外 HTTP/2 开关：
+						// 命中 DisableHTTP2==1 的站点只广告 http/1.1，兼容原生 WebSocket 客户端。
+						GetConfigForClient: waf.GetTLSConfigForClient,
+						MinVersion:         utils.ParseTLSVersion(global.GCONFIG_RECORD_SSLMinVerson),
+						MaxVersion:         utils.ParseTLSVersion(global.GCONFIG_RECORD_SSLMaxVerson),
+					},
+				}
+			}
+
+			// 只在这里 Set 一次：老代码在 h3 协程里回写 serclone，与外层流程存在竞态、
+			// 可能把 H3 字段覆盖丢失(issue #916)。
+			serclone, _ := waf.ServerOnline.Get(innruntime.Port)
+			serclone.Svr = svr
+			serclone.Conns = attachConnCounter(svr)
+			serclone.H3 = h3Holder
+			serclone.Status = 0
+			waf.ServerOnline.Set(innruntime.Port, serclone)
+
+			// HTTP/3 与 TCP 监听彼此独立：QUIC 起不来也绝不能影响 HTTPS(TCP)
+			if global.GCONFIG_ENABLE_HTTP3 == 1 {
+				waf.startHTTP3(innruntime.Port, innruntime.IPVersion, h3Holder)
+			}
+
+			if redirectServer != nil {
+				zlog.Info("启动HTTPS重定向服务器" + portStr)
+				// 端口复用监听，使升级重叠期新旧 Worker 同端口并存
+				rln, rerr := wafnet.ReusePortTCPListenNetwork(utils.NetworkForIPVersion(innruntime.IPVersion), svr.Addr)
+				if rerr != nil {
+					waf.notifyListenFail(innruntime, rerr)
+					return
+				}
+				err := redirectServer.ServeTLSWithListener(rln, "", "")
+				if err == http.ErrServerClosed {
+					zlog.Error("[HTTPServer] https redirect server has been close, cause:[%v]", err)
+				}
+			} else {
+				zlog.Info("启动HTTPS 服务器" + portStr)
+
+				ln, err := wafnet.ReusePortTCPListenNetwork(utils.NetworkForIPVersion(innruntime.IPVersion), svr.Addr)
+				if err != nil {
+					waf.notifyListenFail(innruntime, err)
+					return
+				}
+				if global.GCONFIG_ENABLE_PROXY_PROTOCOL == 1 {
+					ln = &proxyproto.Listener{Listener: ln}
+				}
+				err = svr.ServeTLS(ln, "", "")
+				if err == http.ErrServerClosed {
+					zlog.Error("[HTTPServer] https server has been close, cause:[%v]", err)
+				} else {
+					//TODO 记录如果https 端口被占用的情况 记录日志 且应该推送websocket
+					wafSysLog := model.WafSysLog{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						OpType:    "系统运行错误",
+						OpContent: "HTTPS端口被占用: " + strconv.Itoa(innruntime.Port) + ",请检查",
+					}
+					global.GQEQUE_LOG_DB.Enqueue(&wafSysLog)
+					zlog.Error("[HTTPServer] https server start fail, cause:[%v]", err)
+				}
+				zlog.Info("server https shutdown")
+			}
+		} else {
+			defer func() {
+				e := recover()
+				if e != nil { // 捕获该协程的panic 111111
+					zlog.Warn("http recover ", e)
+				}
+			}()
+			svr := &http.Server{
+				Addr:    ":" + strconv.Itoa(innruntime.Port),
+				Handler: waf,
+			}
+			serclone, _ := waf.ServerOnline.Get(innruntime.Port)
+			serclone.Svr = svr
+			serclone.Conns = attachConnCounter(svr)
+			serclone.Status = 0
+
+			waf.ServerOnline.Set(innruntime.Port, serclone)
+
+			zlog.Info("启动HTTP 服务器" + strconv.Itoa(innruntime.Port))
+			ln, err := wafnet.ReusePortTCPListenNetwork(utils.NetworkForIPVersion(innruntime.IPVersion), svr.Addr)
+			if err != nil {
+				waf.notifyListenFail(innruntime, err)
+				return
+			}
+			if global.GCONFIG_ENABLE_PROXY_PROTOCOL == 1 {
+				ln = &proxyproto.Listener{Listener: ln}
+
+			}
+			err = svr.Serve(ln)
+			if err == http.ErrServerClosed {
+				zlog.Warn("[HTTPServer] http server has been close, cause:[%v]", err)
+			} else {
+				//TODO 记录如果http 端口被占用的情况 记录日志 且应该推送websocket
+				wafSysLog := model.WafSysLog{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					OpType:    "系统运行错误",
+					OpContent: "HTTP端口被占用: " + strconv.Itoa(innruntime.Port) + ",请检查",
+				}
+				global.GQEQUE_LOG_DB.Enqueue(&wafSysLog)
+				zlog.Error("[HTTPServer] http server start fail, cause:[%v]", err)
+			}
+			zlog.Info("server  http shutdown")
+		}
+
+	}(innruntime)
+}
+
+// 关闭所有代理服务
+func (waf *WafEngine) StopAllProxyServer() {
+	// 并发对所有端口优雅排空，避免 N 个端口串行叠加 N×超时；
+	// 各端口独立 Shutdown(ctx)，全部返回即所有在途连接处理完毕。
+	timeout := time.Duration(global.GCONFIG_RECORD_DRAIN_TIMEOUT) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	var wg sync.WaitGroup
+	waf.ServerOnline.Range(func(port int, v innerbean.ServerRunTime) bool {
+		wg.Add(1)
+		go func(v innerbean.ServerRunTime) {
+			defer wg.Done()
+			waf.gracefulStopServer(v, timeout)
+		}(v)
+		return true
+	})
+	wg.Wait()
+}
+
+// 关闭指定代理服务（保持兼容：默认按配置的排空超时优雅关闭）
+func (waf *WafEngine) StopProxyServer(v innerbean.ServerRunTime) {
+	timeout := time.Duration(global.GCONFIG_RECORD_DRAIN_TIMEOUT) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	waf.gracefulStopServer(v, timeout)
+}
+
+// gracefulStopServer 优雅关闭单个端口的 HTTP/HTTPS/HTTP3 服务：
+// 先停止接收新连接并等待在途请求处理完(Shutdown)，超时仍未排空则强制 Close。
+func (waf *WafEngine) gracefulStopServer(v innerbean.ServerRunTime, timeout time.Duration) {
+	// 先停 HTTP/3：摘掉 Alt-Svc 后新响应不再把客户端引导到即将关闭的 UDP 端口，
+	// 同时释放 UDP socket(quic-go 不会替我们关它)。
+	if v.H3 != nil {
+		waf.stopHTTP3(v.Port, v.H3)
+	}
+	if v.Svr != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		remain := int64(0)
+		if v.Conns != nil {
+			remain = atomic.LoadInt64(v.Conns)
+		}
+		if err := v.Svr.Shutdown(ctx); err != nil {
+			// 超时(或出错)：记录剩余连接数后强制关闭，不让停止流程卡死
+			if v.Conns != nil {
+				remain = atomic.LoadInt64(v.Conns)
+			}
+			zlog.Warn("[GracefulStop] 端口 " + strconv.Itoa(v.Port) + " 排空超时，强制关闭剩余连接数=" + strconv.FormatInt(remain, 10) + " err=" + err.Error())
+			_ = v.Svr.Close()
+		} else {
+			zlog.Info("[GracefulStop] 端口 " + strconv.Itoa(v.Port) + " 已优雅排空 (起始连接数=" + strconv.FormatInt(remain, 10) + ")")
+		}
+		cancel()
+	}
+}
+
+// attachConnCounter 给 http.Server 挂上连接计数回调，返回原子计数指针。
+// 计数口径：StateNew +1 ；StateClosed / StateHijacked -1（每条连接 New 与终态各触发一次，无泄漏）。
+func attachConnCounter(svr *http.Server) *int64 {
+	counter := new(int64)
+	svr.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateNew:
+			atomic.AddInt64(counter, 1)
+		case http.StateClosed, http.StateHijacked:
+			atomic.AddInt64(counter, -1)
+		}
+	}
+	return counter
+}
+
+// WaitProxyReady 对所有已上线代理端口做就绪自检：逐个 Dial 127.0.0.1:port，
+// 全部可连才返回 nil；任一端口在 timeout 内不可连则返回错误。
+// 用于升级接管(takeover)时，新 Worker 在向 Supervisor 上报 READY 前确认端口已真正接管成功，
+// 覆盖任意数量的自定义端口。
+func (waf *WafEngine) WaitProxyReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ports := make([]int, 0)
+	waf.ServerOnline.Range(func(port int, v innerbean.ServerRunTime) bool {
+		if v.Port > 0 {
+			ports = append(ports, v.Port)
+		}
+		return true
+	})
+	for _, port := range ports {
+		addr := "127.0.0.1:" + strconv.Itoa(port)
+		ok := false
+		for time.Now().Before(deadline) {
+			conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+			if err == nil {
+				_ = conn.Close()
+				ok = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !ok {
+			return fmt.Errorf("端口 %d 就绪自检失败(在 %s 内未能建立连接)", port, timeout)
+		}
+	}
+	zlog.Info("[ReadyCheck] 所有代理端口就绪自检通过，端口数=" + strconv.Itoa(len(ports)))
+	return nil
+}
+
+// TotalConns 汇总所有在线端口当前打开的连接数（用于升级时向 Supervisor 上报心跳/排空进度）。
+func (waf *WafEngine) TotalConns() int64 {
+	var total int64
+	waf.ServerOnline.Range(func(port int, v innerbean.ServerRunTime) bool {
+		if v.Conns != nil {
+			total += atomic.LoadInt64(v.Conns)
+		}
+		return true
+	})
+	return total
+}
+
+func (waf *WafEngine) ClearCcWindows() {
+	// 多规则计数器：回收空闲计数键，防止客户端数量随攻击持续增长
+	if removed := GCCCounter.Cleanup(300); removed > 0 {
+		zlog.Debug(fmt.Sprintf("CC计数器回收空闲键 %d 个，当前活跃 %d", removed, GCCCounter.ActiveKeys()))
+	}
+	// 清理所有主机的IP限流器记录
+	for _, hostSafe := range waf.rt().HostTarget {
+		if hostSafe.PluginIpRateLimiter != nil {
+			hostSafe.PluginIpRateLimiter.CleanupOldRecords()
+		}
+	}
+}
+
+// ClearCcWindowsForIP 清理特定IP的CC限流记录
+func (waf *WafEngine) ClearCcWindowsForIP(ip string) {
+	// 遍历所有主机，清理指定IP的限流记录
+	hostCount := 0
+	for hostKey, hostSafe := range waf.rt().HostTarget {
+		if hostSafe.PluginIpRateLimiter != nil {
+			// 获取清理前的请求计数
+			var countBefore int
+			countBefore = hostSafe.PluginIpRateLimiter.GetRequestCount(ip)
+
+			// 清理该IP的限流记录
+			hostSafe.PluginIpRateLimiter.ClearWindowForIP(ip)
+			hostCount++
+
+			// 获取清理后的请求计数
+			var countAfter int
+			countAfter = hostSafe.PluginIpRateLimiter.GetRequestCount(ip)
+
+			// 打印清理前后的计数信息
+			zlog.Debug(fmt.Sprintf("主机 %s 的 IP %s 限流记录: 清理前=%d, 清理后=%d",
+				hostKey, ip, countBefore, countAfter))
+		}
+	}
+
+	zlog.Debug(fmt.Sprintf("已清理 IP %s 在 %d 个主机上的 CC 限流记录", ip, hostCount),
+		zap.String("ip", ip),
+		zap.Int("hostCount", hostCount))
+}
+
+// UpdateHostRules 热更新某 host 的规则(copy-on-write)：构建一份全新的 RuleHelper 再整体替换，
+// 绝不就地 LoadRules 改共享的旧 RuleHelper（旧的仍被其他快照的请求 Match 读取，就地改会竞态）。
+func (waf *WafEngine) UpdateHostRules(hostCode string, rules []model.Rules) {
+	rh := &utils.RuleHelper{}
+	rh.InitRuleEngine()
+	rh.LoadRules(rules)
+	waf.UpdateHost(hostCode, func(h *wafenginmodel.HostSafe) {
+		h.RuleData = rules
+		h.Rule = rh
+	})
+}
+
+func (waf *WafEngine) ApplyAntiCCConfig(hostCode string, antiCC model.AntiCC) {
+	// 字段级热更新(copy-on-write)：在副本上改 AntiCC 相关字段后原子发布。
+	waf.UpdateHost(hostCode, func(hostSafe *wafenginmodel.HostSafe) {
+		if antiCC.Id == "" {
+			// 关闭CC防护
+			hostSafe.PluginIpRateLimiter = nil
+			hostSafe.AntiCCBean = antiCC
+			zlog.Debug("Anticc disabled", zap.String("hostCode", hostCode))
+			return
+		}
+
+		// 与冷启动(LoadHost)共用同一构造函数，保证保存前后与重启前后的阈值一致
+		hostSafe.PluginIpRateLimiter = BuildIPRateLimiter(antiCC, hostSafe.Host.Host)
+		hostSafe.AntiCCBean = antiCC
+
+		zlog.Debug("远程配置", zap.Any("Anticc", antiCC))
+	})
+}
+
+// checkWithPlugins 使用插件系统检查请求
+// 返回检测结果
+// 注意：此方法预留用于未来的插件集成
+// 当前版本中，插件管理器的实际调用逻辑需要在 go-plugin 集成后完善
+func (waf *WafEngine) checkWithPlugins(r *http.Request, weblogbean *innerbean.WebLog, hostTarget *wafenginmodel.HostSafe, group string) detection.Result {
+	// 检查插件管理器是否存在
+	if waf.PluginManager == nil {
+		return detection.Result{IsBlock: false}
+	}
+
+	// 类型断言获取插件管理器（定义需要的方法）
+	pluginManager, ok := waf.PluginManager.(interface {
+		CheckRequest(ctx context.Context, group string, ip string, requestPath string, userAgent string, method string, host string) (bool, string)
+	})
+
+	// 如果类型断言失败，直接返回
+	if !ok {
+		return detection.Result{IsBlock: false}
+	}
+
+	// 提取请求信息 - 使用已有的 getClientIP 方法
+	_, clientIP, _ := waf.getClientIP(r, strings.Split(global.GCONFIG_RECORD_PROXY_HEADER, ",")...)
+	if clientIP == "" {
+		// 如果获取 IP 失败，从 RemoteAddr 获取
+		clientIP = strings.Split(r.RemoteAddr, ":")[0]
+	}
+	requestPath := r.URL.Path
+	userAgent := r.UserAgent()
+
+	// 调用插件管理器检查请求
+	ctx := context.Background()
+	isBlock, reason := pluginManager.CheckRequest(ctx, group, clientIP, requestPath, userAgent, r.Method, r.Host)
+
+	// 如果插件要求拦截
+	if isBlock {
+		// 记录到日志
+		if weblogbean != nil && weblogbean.REQ_UUID == "" {
+			weblogbean.REQ_UUID = uuid.GenUUID()
+		}
+		if weblogbean != nil {
+			weblogbean.RULE = "插件拦截"
+		}
+
+		return detection.Result{
+			IsBlock: true,
+			Title:   "插件拦截",
+			Content: reason,
+		}
+	}
+
+	// 插件检查通过，不拦截
+	return detection.Result{IsBlock: false}
+}
+
+// shouldAutoJumpHTTPS 判断是否应该自动跳转到HTTPS
+// 参数:
+//   - requestHost: 请求的host(如: aaa.samwaf.com:80 或 bbb.aaa.samwaf.com:8080)
+//   - configHost: 配置的host(如: *.samwaf.com 或 example.com)
+//   - requestURL: 请求的URL路径
+//   - autoJumpHTTPS: 是否开启自动跳转HTTPS
+//   - ssl: 是否启用了SSL
+//
+// 返回:
+//   - bool: 是否应该跳转
+//   - string: 跳转的域名部分(不含端口)
+//
+// 支持场景:
+//   - 精确匹配: example.com:80 匹配 example.com
+//   - 二级泛域名: aaa.samwaf.com:80 匹配 *.samwaf.com
+//   - 多级泛域名: bbb.aaa.samwaf.com:8080 匹配 *.samwaf.com (利用MaskSubdomain)
+func shouldAutoJumpHTTPS(requestHost, configHost, requestURL string, autoJumpHTTPS, ssl int) (bool, string) {
+	// 检查基本条件：必须开启自动跳转和SSL
+	if autoJumpHTTPS != 1 || ssl != 1 {
+		return false, ""
+	}
+
+	// 排除SSL证书验证路径
+	if strings.HasPrefix(requestURL, global.GSSL_HTTP_CHANGLE_PATH) {
+		return false, ""
+	}
+
+	// 从请求host中提取域名和端口
+	requestDomain := ""
+	requestPort := ""
+	if strings.Contains(requestHost, ":") {
+		parts := strings.Split(requestHost, ":")
+		if len(parts) == 2 {
+			requestDomain = parts[0]
+			requestPort = parts[1]
+		}
+	} else {
+		requestDomain = requestHost
+	}
+
+	// 判断是否是HTTP端口（80或其他非443端口）
+	// 如果没有端口号或者端口是443，不需要跳转
+	if requestPort == "" || requestPort == "443" {
+		return false, ""
+	}
+
+	// 检查域名是否匹配
+	matched := false
+
+	// 情况1: 精确匹配（如: example.com 匹配 example.com）
+	if requestDomain == configHost {
+		matched = true
+	}
+
+	// 情况2: 配置host带端口的精确匹配（如: example.com:80 匹配 example.com:80）
+	if !matched && strings.Contains(configHost, ":") {
+		if requestHost == configHost {
+			matched = true
+		}
+	}
+
+	// 情况3: 泛域名匹配（支持多级域名）
+	// 例如: aaa.samwaf.com:80 匹配 *.samwaf.com
+	//      bbb.aaa.samwaf.com:80 匹配 *.samwaf.com
+	//      ccc.bbb.aaa.samwaf.com:8080 匹配 *.samwaf.com
+	if !matched && strings.HasPrefix(configHost, "*.") {
+		// 方法1: 直接匹配（二级域名）
+		// 提取主域名部分（去掉*.）
+		baseDomain := configHost[2:] // 去掉 "*."
+		// 检查请求域名是否以主域名结尾
+		if strings.HasSuffix(requestDomain, baseDomain) {
+			// 确保是完整的子域名匹配，而不是部分匹配
+			// 例如: aaa.samwaf.com 匹配 *.samwaf.com
+			// 但 aaasamwaf.com 不匹配 *.samwaf.com
+			if requestDomain != baseDomain && strings.HasSuffix(requestDomain, "."+baseDomain) {
+				matched = true
+			}
+		}
+
+		// 方法2: 使用MaskSubdomain处理多级域名
+		// 例如: bbb.aaa.samwaf.com:80 -> *.aaa.samwaf.com:80
+		// 然后递归检查 *.aaa.samwaf.com 是否匹配 *.samwaf.com
+		if !matched {
+			maskedHost := domaintool.MaskSubdomain(requestHost)
+			// maskedHost 示例: *.aaa.samwaf.com:80
+			// 如果 maskedHost 和 requestHost 不同，说明有多级域名
+			if maskedHost != requestHost {
+				// 提取 maskedHost 的域名部分（去掉端口）
+				maskedDomain := maskedHost
+				if strings.Contains(maskedHost, ":") {
+					maskedDomain = strings.Split(maskedHost, ":")[0]
+				}
+
+				// 递归检查: *.aaa.samwaf.com 是否匹配 *.samwaf.com
+				// 即检查 aaa.samwaf.com 是否匹配 *.samwaf.com 的baseDomain
+				if strings.HasPrefix(maskedDomain, "*.") {
+					checkDomain := maskedDomain[2:] // 去掉 "*."，得到 aaa.samwaf.com
+					// 检查 aaa.samwaf.com 是否匹配 *.samwaf.com
+					if strings.HasSuffix(checkDomain, baseDomain) {
+						if checkDomain != baseDomain && strings.HasSuffix(checkDomain, "."+baseDomain) {
+							matched = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if matched {
+		return true, requestDomain
+	}
+
+	return false, ""
+}

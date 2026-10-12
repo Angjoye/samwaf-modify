@@ -1,0 +1,218 @@
+package wafdb
+
+import (
+	"SamWaf/common/zlog"
+	"SamWaf/global"
+	"SamWaf/utils"
+	"SamWaf/wafdb/dialect"
+	"encoding/json"
+	"fmt"
+	"gorm.io/gorm"
+	"time"
+)
+
+// DatabaseMetrics 数据库性能指标结构体
+type DatabaseMetrics struct {
+	DatabaseName     string  `json:"database_name"`      // 数据库名称
+	DatabasePath     string  `json:"database_path"`      // 数据库文件路径（SQLite）
+	FileSize         int64   `json:"file_size"`          // 文件大小(字节)，SQLite only
+	FileSizeMB       float64 `json:"file_size_mb"`       // 文件大小(MB)，SQLite only
+	ConnectionCount  int     `json:"connection_count"`   // 连接数
+	MaxConnections   int     `json:"max_connections"`    // 最大连接数
+	IdleConnections  int     `json:"idle_connections"`   // 空闲连接数
+	InUseConnections int     `json:"in_use_connections"` // 使用中连接数
+
+	// SQLite特有的PRAGMA信息
+	PageCount       int64   `json:"page_count,omitempty"`       // 页面总数
+	PageSize        int64   `json:"page_size,omitempty"`        // 页面大小
+	FreelistCount   int64   `json:"freelist_count,omitempty"`   // 空闲页面数
+	CacheSize       int64   `json:"cache_size,omitempty"`       // 缓存大小
+	JournalMode     string  `json:"journal_mode,omitempty"`     // 日志模式
+	SynchronousMode string  `json:"synchronous_mode,omitempty"` // 同步模式
+	TempStore       string  `json:"temp_store,omitempty"`       // 临时存储模式
+	CacheHitRatio   float64 `json:"cache_hit_ratio,omitempty"`  // 缓存命中率
+
+	// MySQL / SQL Server specific
+	EngineVersion string  `json:"engine_version,omitempty"`      // 数据库版本
+	DataSizeMB    float64 `json:"data_size_mb,omitempty"`        // 数据大小(MB)
+	IndexSizeMB   float64 `json:"index_size_mb,omitempty"`       // 索引大小(MB)
+	CurrentConns  int     `json:"current_connections,omitempty"` // 当前连接数(服务器端)
+
+	// 时间戳
+	Timestamp time.Time `json:"timestamp"` // 采集时间
+}
+
+// GetDatabaseMetrics 获取指定数据库的性能指标
+func GetDatabaseMetrics(db *gorm.DB, dbName string, dbPath string) (*DatabaseMetrics, error) {
+	dm, err := dialect.Get().CollectMetrics(db, dbName, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	return &DatabaseMetrics{
+		DatabaseName:     dm.DatabaseName,
+		DatabasePath:     dm.DatabasePath,
+		FileSize:         dm.FileSize,
+		FileSizeMB:       dm.FileSizeMB,
+		ConnectionCount:  dm.ConnectionCount,
+		MaxConnections:   dm.MaxConnections,
+		IdleConnections:  dm.IdleConnections,
+		InUseConnections: dm.InUseConnections,
+		Timestamp:        dm.Timestamp,
+		PageCount:        dm.PageCount,
+		PageSize:         dm.PageSize,
+		FreelistCount:    dm.FreelistCount,
+		CacheSize:        dm.CacheSize,
+		JournalMode:      dm.JournalMode,
+		SynchronousMode:  dm.SynchronousMode,
+		TempStore:        dm.TempStore,
+		CacheHitRatio:    dm.CacheHitRatio,
+		EngineVersion:    dm.EngineVersion,
+		DataSizeMB:       dm.DataSizeMB,
+		IndexSizeMB:      dm.IndexSizeMB,
+		CurrentConns:     dm.CurrentConns,
+	}, nil
+}
+
+// MonitorAllDatabases 监控所有数据库的性能指标
+func MonitorAllDatabases() ([]*DatabaseMetrics, error) {
+	var allMetrics []*DatabaseMetrics
+	currentDir := utils.GetCurrentDir()
+
+	// 监控主数据库
+	if global.GWAF_LOCAL_DB != nil {
+		mainDbPath := currentDir + "/data/local.db"
+		if metrics, err := GetDatabaseMetrics(global.GWAF_LOCAL_DB, "主数据库(Core)", mainDbPath); err == nil {
+			allMetrics = append(allMetrics, metrics)
+		} else {
+			zlog.Error("获取主数据库指标失败:", err)
+		}
+	}
+
+	// 监控日志数据库
+	if global.GWAF_LOCAL_LOG_DB != nil {
+		logDbPath := currentDir + "/data/local_log.db"
+		if metrics, err := GetDatabaseMetrics(global.GWAF_LOCAL_LOG_DB, "日志数据库(Log)", logDbPath); err == nil {
+			allMetrics = append(allMetrics, metrics)
+		} else {
+			zlog.Error("获取日志数据库指标失败:", err)
+		}
+	}
+
+	// 监控统计数据库
+	if global.GWAF_LOCAL_STATS_DB != nil {
+		statsDbPath := currentDir + "/data/local_stats.db"
+		if metrics, err := GetDatabaseMetrics(global.GWAF_LOCAL_STATS_DB, "统计数据库(Stats)", statsDbPath); err == nil {
+			allMetrics = append(allMetrics, metrics)
+		} else {
+			zlog.Error("获取统计数据库指标失败:", err)
+		}
+	}
+
+	// 监控自定义日志数据库（走快照，避免与按需打开/淘汰并发读写同一张 map）
+	{
+		for fileName, db := range snapshotShardDBs() {
+			if db != nil {
+				customDbPath := currentDir + "/data/" + fileName
+				dbName := fmt.Sprintf("自定义日志数据库(%s)", fileName)
+				if metrics, err := GetDatabaseMetrics(db, dbName, customDbPath); err == nil {
+					allMetrics = append(allMetrics, metrics)
+				} else {
+					zlog.Error("获取自定义数据库指标失败:", fileName, err)
+				}
+			}
+		}
+	}
+
+	return allMetrics, nil
+}
+
+// PrintDatabaseMetrics 打印数据库性能指标
+func PrintDatabaseMetrics() {
+	metrics, err := MonitorAllDatabases()
+	if err != nil {
+		zlog.Error("监控数据库失败:", err)
+		return
+	}
+
+	zlog.Info("==================== 数据库性能监控报告 ====================")
+	zlog.Info("采集时间:", time.Now().Format("2006-01-02 15:04:05"))
+	zlog.Info("")
+
+	for _, m := range metrics {
+		// 构建缓存命中率信息
+		cacheHitInfo := ""
+		if m.CacheHitRatio > 0 {
+			cacheHitInfo = fmt.Sprintf("\n    - 缓存命中率: %.2f%%", m.CacheHitRatio)
+		}
+
+		dbInfo := fmt.Sprintf(`【%s】
+  数据库路径: %s
+  文件大小: %.2f MB (%d 字节)
+  连接池信息:
+    - 当前连接数: %d
+    - 最大连接数: %d
+    - 空闲连接数: %d
+    - 使用中连接数: %d
+  SQLite配置:
+    - 页面总数: %d
+    - 页面大小: %d 字节
+    - 空闲页面数: %d
+    - 缓存大小: %d
+    - 日志模式: %s
+    - 同步模式: %s
+    - 临时存储: %s%s`,
+			m.DatabaseName,
+			m.DatabasePath,
+			m.FileSizeMB, m.FileSize,
+			m.ConnectionCount,
+			m.MaxConnections,
+			m.IdleConnections,
+			m.InUseConnections,
+			m.PageCount,
+			m.PageSize,
+			m.FreelistCount,
+			m.CacheSize,
+			m.JournalMode,
+			m.SynchronousMode,
+			m.TempStore,
+			cacheHitInfo)
+
+		zlog.Info(dbInfo)
+		zlog.Info("")
+	}
+	zlog.Info("========================================================")
+}
+
+// GetDatabaseMetricsJSON 获取数据库指标的JSON格式
+func GetDatabaseMetricsJSON() (string, error) {
+	metrics, err := MonitorAllDatabases()
+	if err != nil {
+		return "", err
+	}
+
+	jsonData, err := json.Marshal(metrics)
+	if err != nil {
+		return "", fmt.Errorf("序列化JSON失败: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// StartDatabaseMonitoring 启动定时数据库监控
+func StartDatabaseMonitoring(intervalMinutes int) {
+	if intervalMinutes <= 0 {
+		intervalMinutes = 5 // 默认5分钟
+	}
+
+	ticker := time.NewTicker(time.Duration(intervalMinutes) * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				PrintDatabaseMetrics()
+			}
+		}
+	}()
+
+	zlog.Info("数据库性能监控已启动，监控间隔: %d 分钟", intervalMinutes)
+}

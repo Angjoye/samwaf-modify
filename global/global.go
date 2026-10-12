@@ -1,0 +1,416 @@
+package global
+
+import (
+	"SamWaf/cache"
+	"SamWaf/common/gwebsocket"
+	"SamWaf/common/queue"
+	"SamWaf/iplocation"
+	"SamWaf/model"
+	"SamWaf/model/spec"
+	"SamWaf/wafai"
+	"SamWaf/wafnotify"
+	"SamWaf/wafowasp"
+	"SamWaf/wafsnowflake"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"github.com/bytedance/godlp/dlpheader"
+	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
+	"github.com/oschwald/geoip2-golang"
+	"gorm.io/gorm"
+)
+
+const (
+	GWAF_NAME   = "SamWaf"
+	Version_num = 1
+)
+
+var (
+
+	/*本机信息**/
+	GWAF_RUNTIME_IP          string = "127.0.0.1" //本机当前外网IP
+	GWAF_RUNTIME_AREA        string = ""          //本机当前所在区域
+	GWAF_RUNTIME_SERVER_TYPE bool   = false       //当前是是否以服务形式启动
+	GWAF_RUNTIME_IS_TAKEOVER bool   = false       //当前 Worker 是否以升级接管(takeover)方式启动：与旧 Worker 并存，需跳过整库备份等仅首启动作
+
+	// 调试：在响应头 X-SamWaf-Worker 标记处理请求的 Worker 进程，用于验证升级时新旧 Worker 交替。
+	// 仅当环境变量 SAMWAF_WORKER_HEADER=1 时开启（默认关闭，避免对外暴露 PID）。
+	GWAF_DEBUG_WORKER_HEADER bool   = false
+	GWAF_WORKER_TAG          string = "" //当前进程标识(pid+启动时间)
+
+	GWAF_RUNTIME_NEW_VERSION      string = ""      //最新版本号
+	GWAF_RUNTIME_NEW_VERSION_DESC string = ""      //最新版本描述
+	GWAF_RUNTIME_WIN7_VERSION     string = "false" //是否是win7内部版本
+	GWAF_RUNTIME_QPS              uint64 = 0       //当前qps (累积值)
+	GWAF_RUNTIME_LOG_PROCESS      uint64 = 0       //log 处理速度 (累积值)
+
+	// QPS实时计算相关变量 (用于差分计算)
+	GWAF_LAST_QPS_VALUE           uint64 = 0 //上次QPS计数值
+	GWAF_LAST_LOG_QPS_VALUE       uint64 = 0 //上次日志QPS计数值
+	GWAF_LAST_QPS_TIME            int64  = 0 //上次QPS计算时间
+	GWAF_CURRENT_REALTIME_QPS     uint64 = 0 //当前实时QPS
+	GWAF_CURRENT_REALTIME_LOG_QPS uint64 = 0 //当前实时日志QPS
+
+	GWAF_RUNTIME_DNS_SERVER  string = "119.29.29.29" //反向查询DNS的IP
+	GWAF_RUNTIME_DNS_TIMEOUT int64  = 500            // DNS 查询超时时间 单位毫秒
+
+	GWAF_RUNTIME_RECORD_LOG_TYPE string = "all" // 记录日志形式： 全部(all),非正常(abnormal)
+	GCONFIG_EXCLUDE_IP_LOG       string = ""    // 全局排除记录日志的IP清单(所有站点生效)，语法同站点级 exclude_ip_log
+	GWAF_RUNTIME_IS_UPDATETING   bool   = false //是否正在升级中
+
+	GWAF_RUNTIME_CURRENT_EXEPATH                 string = "" //当前程序运行路径
+	GWAF_RUNTIME_CURRENT_WEBPORT                 string = "" //当前程序所占用端口
+	GWAF_RUNTIME_CURRENT_TUNNELPORT              string = "" //当前程序所占用隧道端口
+	GWAF_RUNTIME_CURRENT_EXPORT_DB_LOG_FILE_PATH string = "" //生成的日志导出文件路径
+
+	GWAF_RUNTIME_PROCESS_START_TIME time.Time = time.Now() //当前进程启动时间(包加载即赋值)
+
+	GWAF_RUNTIME_SSL_EXPIRE_CHECK bool = false //SSL过期检测是否正在运行
+	GWAF_RUNTIME_SSL_SYNC_HOST    bool = false //主机同步信息到过期检测是否正在运行
+	/**
+	遥测数据
+	*/
+	GWAF_MEASURE_PROCESS_DEQUEENGINE cache.WafOnlyLockWriteData //遥测数据-队列处理时间
+
+	GWAF_GLOBAL_HOST_NAME   string   = "全局网站:0"    //全局网站
+	GWAF_GLOBAL_HOST_CODE   string   = "0"         //全局网站代码
+	GWAF_LOCAL_DB           *gorm.DB               //通用本地数据库，尊重用户隐私
+	GWAF_LOCAL_LOG_DB       *gorm.DB               //通用本地数据库存日志数据，尊重用户隐私
+	GWAF_LOCAL_STATS_DB     *gorm.DB               //通用本地数据库存放统计数据，尊重用户隐私
+	GWAF_REMOTE_DB          *gorm.DB               //仅当用户使用云数据库
+	GWAF_LOCAL_SERVER_PORT  int      = 26666       // 本地local端口
+	GWAF_LOCAL_INDEX_HTML   string                 //本地首页HTML信息
+	GWAF_USER_CODE          string                 // 当前识别号
+	GWAF_CUSTOM_SERVER_NAME string                 // 当前服务器自定义名称
+	GWAF_TENANT_ID          string   = "SamWafCom" // 当前租户ID
+
+	//管理端访问控制
+	GWAF_IP_WHITELIST            string = "0.0.0.0/0,::/0" //IP白名单 后台默认放行所有
+	GWAF_DOMAIN_WHITELIST        string = ""               //域名白名单，为空时不限制，多个用逗号分隔
+	GWAF_SSL_ENABLE              bool   = false            //是否启用SSL证书
+	GWAF_SSL_FORCE_HTTPS         bool   = false            //管理端是否仅允许HTTPS访问（开启后纯HTTP请求301跳转到HTTPS），默认HTTP/HTTPS都允许
+	GWAF_SSL_BIND_CERT_ID        string = ""               //管理端证书绑定的证书夹(SslConfig)ID，为空表示未绑定（使用手动上传的证书）
+	GWAF_SECURITY_ENTRY_ENABLE   bool   = false            //是否启用安全路径入口
+	GWAF_SECURITY_ENTRY_PATH     string = ""               //安全路径（18位随机码）
+	GWAF_SECURITY_EMERGENCY_PATH string = ""               //应急恢复路径（随机生成，首次启动自动写入 conf/config.yml）
+
+	//zlog 日志相关信息
+	GWAF_LOG_OUTPUT_FORMAT       string              = "console"           //zlog输出格式 控制台格式console,json格式
+	GWAF_LOG_DEBUG_ENABLE        bool                = false               //是否开启debug日志，默认关闭
+	GWAF_LOG_DEBUG_DB_ENABLE     bool                = false               //是否开启数据库日志，默认关闭
+	GWAF_RELEASE                 string              = "false"             // 当前是否为发行版
+	GWAF_RELEASE_VERSION_NAME    string              = "20241028"          // 发行版的版本号名称
+	GWAF_RELEASE_VERSION         string              = "v1.0.0"            // 发行版的版本号
+	GWAF_WEB_VERSION             string              = "本地构建"              // 内嵌管理端前端版本（main 启动时从 public 包版本戳读取）
+	GWAF_LAST_UPDATE_TIME        time.Time                                 // 上次时间
+	GWAF_NOTICE_ENABLE           bool                = false               // 是否开启通知
+	GWAF_NOTICE_TITLE            string                                    // 通知消息标题前缀（用于区分多实例，默认使用 custom_server_name）
+	GWAF_CAN_EXPORT_DOWNLOAD_LOG bool                = false               //是否可以导出下载日志
+	GWAF_CAN_APP_MANAGE          bool                = false               //是否启用应用管理功能（默认关闭，需服务端配置才能开启）
+	GWAF_APP_ALLOW_DIRS          string              = "data/applications" //应用允许的工作目录（逗号分隔多路径）
+	GWAF_APP_OP_PASSWORD         string                                    //应用操作密码（高危操作二次确认，自动生成存 config.yml）
+	GWAF_DLP                     dlpheader.EngineAPI                       // 脱敏引擎
+	GWAF_DLP_CONFIG              string                                    // 脱敏引擎配置数据
+	GWAF_AI_DETECTOR             *wafai.Detector                           // AI智能检测器（持有当前模型，失败安全）
+
+	GWAF_OWASP         *wafowasp.WafOWASP     //owasp引擎（兼容保留：由 GWAF_OWASP_MANAGER.Current() 更新；请勿直接赋值新实例，否则热重载会失效）
+	GWAF_OWASP_MANAGER *wafowasp.OwaspManager //owasp 管理器（支持热重载）
+	/**链聚合**/
+	GWAF_CHAN_HOST                                  = make(chan model.Hosts, 10)         //主机链
+	GWAF_CHAN_ENGINE                                = make(chan int, 10)                 //引擎链
+	GWAF_CHAN_MSG                                   = make(chan spec.ChanCommonHost, 10) //全局通讯包
+	GWAF_CHAN_COMMON_MSG                            = make(chan spec.ChanCommon, 10)     //全局共用通讯包
+	GWAF_CHAN_UPDATE                                = make(chan int, 10)                 //升级后处理链
+	GWAF_CHAN_SENSITIVE                             = make(chan int, 10)                 //敏感词处理链
+	GWAF_CHAN_SSL                                   = make(chan string, 10)              //证书处理链
+	GWAF_CHAN_SSLOrder                              = make(chan spec.ChanSslOrder, 10)   //SSL证书申请
+	GWAF_CHAN_SSL_EXPIRE_CHECK                      = make(chan int, 10)                 //SSL证书到期检测
+	GWAF_CHAN_SYNC_HOST_TO_SSL_EXPIRE               = make(chan int, 10)                 //同步已存在主机到SSL证书检测任务里
+	GWAF_CHAN_TASK                                  = make(chan string, 10)              //手工执行任务
+	GWAF_CHAN_TASK_RELOAD                           = make(chan model.Task, 10)          //任务重新加载
+	GWAF_CHAN_CLEAR_CC_WINDOWS                      = make(chan int, 10)                 //清除cc缓存信息
+	GWAF_CHAN_CLEAR_CC_IP                           = make(chan string, 10)              //清除cc缓存信息IP
+	GWAF_QUEUE_SHUTDOWN_SIGNAL        chan struct{} = make(chan struct{})                // 队列关闭信号
+	GWAF_CHAN_MANAGER_RESTART                       = make(chan int, 1)                  // 管理端重启信号
+	GWAF_CHAN_HTTP3                                 = make(chan int, 1)                  // HTTP/3 开关变更信号(配置热生效)
+
+	GWAF_SHUTDOWN_SIGNAL bool = false // 系统关闭信号
+	/*****CACHE相关*********/
+	GCACHE_WAFCACHE      cache.CacheStore      //cache
+	GCACHE_WECHAT_ACCESS string           = "" //微信访问密钥
+
+	// Cache后端配置
+	GCACHE_TYPE           string = "memory" // 缓存类型: memory（默认）| redis
+	GCACHE_REDIS_HOST     string = "127.0.0.1"
+	GCACHE_REDIS_PORT     int    = 6379
+	GCACHE_REDIS_PASSWORD string = ""
+	GCACHE_REDIS_DB       int    = 0
+	// 连接池与单次操作上限，0 表示用 go-redis 默认值(池大小 10 × GOMAXPROCS)。
+	// 管理端鉴权与业务检测共用同一个池，机器核数多时不宜固定成小值。
+	GCACHE_REDIS_POOL_SIZE        int = 0
+	GCACHE_REDIS_POOL_TIMEOUT_SEC int = 0
+	GCACHE_REDIS_OP_TIMEOUT_SEC   int = 0
+
+	/*********HTTP相关**************/
+	GWAF_HTTP_SENSITIVE_REPLACE_STRING = "**" //HTTP 敏感内容替换成
+
+	/*********IP相关**************/
+	GCACHE_IP_CBUFF            []byte         // IP相关缓存 (已废弃，由 GIPLOCATION_MANAGER 管理)
+	GCACHE_IP_V6_COUNTRY_CBUFF []byte         // IPv6国家相关缓存 (已废弃，由 GIPLOCATION_MANAGER 管理)
+	GCACHE_IPV4_SEARCHER       *xdb.Searcher  //IPV4得查询器 (已废弃，由 GIPLOCATION_MANAGER 管理)
+	GCACHE_IPV6_SEARCHER       *geoip2.Reader // IPV6得查询器 (已废弃，由 GIPLOCATION_MANAGER 管理)
+
+	// IP 数据库配置
+	GCONFIG_IP_V4_SOURCE string = "ip2region" // IPv4 数据来源: ip2region / geolite2（ip2region.xdb 随程序内置）
+	GCONFIG_IP_V6_SOURCE string = "ip2region" // IPv6 数据来源: ip2region / geolite2
+	// 注：IPv6 默认自 1.3.24-beta.6 由 geolite2 改为 ip2region —— GeoLite2 受 MaxMind 再分发授权限制，
+	// 已不再随程序内置。ip2region_v6.xdb 需在【IP库管理】在线下载或自行放入 data/。
+	// 只影响新装；老用户 sys_config 里已有的值不动，由 ReloadFromConfig 做运行时降级。
+	GCONFIG_IP_V4_FORMAT string = "legacy"     // IPv4 xdb 字段格式
+	GCONFIG_IP_V6_FORMAT string = "opensource" // IPv6 xdb 字段格式（仅 ip2region 时有效）
+
+	// IP Location Manager 全局实例
+	GIPLOCATION_MANAGER *iplocation.Manager
+
+	GDATA_DELETE_INTERVAL int64 = 180 // 删除180天前的数据
+
+	/****队列相关*****/
+	GQEQUE_DB              *queue.Queue //正常DB队列
+	GQEQUE_UPDATE_DB       *queue.Queue //正常DB 更新队列
+	GQEQUE_LOG_DB          *queue.Queue //日志DB队列
+	GQEQUE_STATS_DB        *queue.Queue //统计DB队列
+	GQEQUE_STATS_UPDATE_DB *queue.Queue //统计更新DB队列
+	GQEQUE_MESSAGE_DB      *queue.Queue //发送消息队列
+
+	/*******通知相关*************/
+	GNOTIFY_KAKFA_SERVICE           *wafnotify.WafNotifyService                                  //通知服务
+	GNOTIFY_LOG_FILE_WRITER         *wafnotify.WafNotifyService                                  //日志文件写入服务
+	GNOTIFY_SEND_MAX_LIMIT_MINTUTES                             = time.Duration(5) * time.Minute // 规则相关信息最大发送抑止 默认5分钟
+
+	/*******日志记录相关*************/
+	GWEBLOG_VERSION = 20250112 //weblog 日志版本号
+	/*********SSL相关*************/
+	GSSL_HTTP_CHANGLE_PATH string = "/.well-known/acme-challenge/" // http01证书验证路径
+
+	/******数据库处理参数*****/
+	GDATA_BATCH_INSERT       int64 = 100         //最大批量插入数量
+	GDATA_SHARE_DB_SIZE      int64 = 100 * 10000 //100w 进行分库 100*10000
+	GDATA_SHARE_DB_FILE_SIZE int64 = 1024        //1024M 进行分库
+	GDATA_CURRENT_CHANGE     bool  = false       //当前是否正在切换
+	// GDATA_ACCESS_LOG_MODE 访问日志窄行档位：off=只留安全事件，db=全量入库，sample=事件+采样。
+	// off 会失去：CC 阈值推荐、AI 训练负样本、异常 IP 的正常行为回溯（全都要正常请求的全量/样本）。
+	GDATA_ACCESS_LOG_MODE string = "db"
+	// GDATA_ACCESS_LOG_RETENTION_DAYS access_log 保留天数。它直接决定 CC 阈值推荐能回看多少天。
+	GDATA_ACCESS_LOG_RETENTION_DAYS int64 = 30
+	// GDATA_ANALYSIS_SCAN_PATH_THRESHOLD 来源分析里「疑似扫目录」的判定线：一天摸过多少个不同路径模板。
+	// 只影响界面上的提示与筛选，不落库、不改任何拦截行为。
+	GDATA_ANALYSIS_SCAN_PATH_THRESHOLD int64 = 20
+	// GDATA_ANALYSIS_UA_THRESHOLD 来源分析里「疑似换 UA 试探」的判定线：一天用过多少种 UA 指纹。
+	GDATA_ANALYSIS_UA_THRESHOLD int64 = 5
+	// GDATA_IP_TAG_DB IP Tag 存放位置：0 核心库，1 统计库。
+	// 新装默认统计库——ip_tags 是派生索引，写入量跟着攻击量走，和配置共用核心库会拖慢每一次配置读写。
+	// 存量用户的取值来自 system_configs 里已有的那一行，不受这个默认值影响；
+	// 切换归属时 MergeIPTagsInto 会把另一个库里的历史标签并过来。
+	GDATA_IP_TAG_DB int64 = 1
+	// GDATA_IP_TAG_MERGING 标签合并任务是否在跑（atomic 读写）。界面据此显示"合并中"。
+	GDATA_IP_TAG_MERGING int32 = 0
+	// GCONFIG_ATTACK_TAG_EXCLUDE 风险日志里不算风险的标签（逗号分隔）。"正常"永远排除，不用写这里。
+	// 这些标签既不出现在规则筛选列表里，也不计入「阻止数量」，而是算作放行。
+	GCONFIG_ATTACK_TAG_EXCLUDE string = "ACME证书校验,静态文件访问成功"
+
+	GDATA_CURRENT_LOG_DB_MAP map[string]*gorm.DB //当前自定义的数据库连接 TODO 如果用户打开了多个 会不会影响内存
+	/******WebSocket*********/
+	GWebSocket *gwebsocket.WebSocketOnline
+
+	//升级相关
+	GUPDATE_VERSION_URL        string = "https://update.samwaf.com/"                                       // 官方下载
+	GUPDATE_GITHUB_VERSION_URL string = "https://update.samwaf.com/samwaf_beta_update/latest_release.json" //从gitHub自动下载镜像
+	//GUPDATE_GITHUB_VERSION_URL string = "http://10.0.2.2:8111/beta_update_linux/latest_release.json"
+	// http://127.0.0.1:8111/beta_update/latest_release.json
+	// http://10.0.2.2:8111/beta_update_linux/latest_release.json
+	GWAF_SNOWFLAKE_GEN *wafsnowflake.Snowflake //雪花算法
+
+	//任务开关信息
+	GWAF_SWITCH_TASK_COUNTER bool
+
+	//数据密码
+	GWAF_PWD_COREDB = "3Y)(27EtO^tK8Bj~CORE" //加密
+	GWAF_PWD_STATDB = "3Y)(27EtO^tK8Bj~STAT" //加密
+	GWAF_PWD_LOGDB  = "3Y)(27EtO^tK8Bj~LOG"  //加密
+
+	// Database driver: "sqlite" | "mysql" | "postgres" (default: sqlite)
+	GWAF_DB_DRIVER string = "sqlite"
+
+	// MySQL connection config (populated from conf/config.yml database.mysql.*)
+	GWAF_MYSQL_HOST                      string = "127.0.0.1"
+	GWAF_MYSQL_PORT                      int    = 3306
+	GWAF_MYSQL_USER                      string = "samwaf"
+	GWAF_MYSQL_PASSWORD                  string = ""
+	GWAF_MYSQL_CHARSET                   string = "utf8mb4"
+	GWAF_MYSQL_CORE_DB                   string = "samwaf_core"
+	GWAF_MYSQL_LOG_DB                    string = "samwaf_log"
+	GWAF_MYSQL_STATS_DB                  string = "samwaf_stats"
+	GWAF_MYSQL_MAX_OPEN_CONNS            int    = 50
+	GWAF_MYSQL_MAX_IDLE_CONNS            int    = 10
+	GWAF_MYSQL_CONN_MAX_LIFETIME_MINUTES int    = 60
+
+	// PostgreSQL connection config (populated from conf/config.yml database.postgres.*)
+	GWAF_PG_HOST     string = "127.0.0.1"
+	GWAF_PG_PORT     int    = 5432
+	GWAF_PG_USER     string = "postgres"
+	GWAF_PG_PASSWORD string = ""
+	GWAF_PG_SSLMODE  string = "disable"
+	// GWAF_PG_TIMEZONE pins the session time zone. It is load-bearing, not cosmetic:
+	// timestamptz values come back in the session zone and customtype.JsonTime renders
+	// whatever Location it is handed, so a wrong value silently shifts every timestamp
+	// shown in the UI. Overridable via database.postgres.timezone.
+	GWAF_PG_TIMEZONE string = "Asia/Shanghai"
+	// GWAF_PG_MAINTENANCE_DB is the database connected to in order to CREATE DATABASE
+	// (PostgreSQL cannot create a database from a connection to that same database).
+	GWAF_PG_MAINTENANCE_DB            string = "postgres"
+	GWAF_PG_CORE_DB                   string = "samwaf_core"
+	GWAF_PG_LOG_DB                    string = "samwaf_log"
+	GWAF_PG_STATS_DB                  string = "samwaf_stats"
+	GWAF_PG_MAX_OPEN_CONNS            int    = 50
+	GWAF_PG_MAX_IDLE_CONNS            int    = 10
+	GWAF_PG_CONN_MAX_LIFETIME_MINUTES int    = 60
+
+	//默认创建的账户和密码
+	GWAF_DEFAULT_ACCOUNT      string = "admin"         //默认创建的账户
+	GWAF_DEFAULT_ACCOUNT_PWD  string = "admin868"      //历史默认口令：新装已改为随机口令(见 InitDefaultAccount)，此值仅作随机生成失败兜底与存量识别
+	GWAF_DEFAULT_ACCOUNT_SALT string = "%@311*abDop#*" //盐值(仅用于校验/识别存量 MD5，bcrypt 迁移后新账户不再使用)
+
+	//通讯加密
+	GWAF_COMMUNICATION_KEY = []byte("7E@u*has$d*@s5YX") //通讯加密密钥
+
+	//资源下载
+	GWAF_BOT_IP_URL_MAIN string = "https://raw.githubusercontent.com/samwafgo/SamWafBotIPDatabase/main/allowlist/index.json"
+
+	/**
+	授权注册信息部分
+	*/
+	GWAF_REG_INFO       model.RegistrationInfo                              //当前注册信息
+	GWAF_REG_VERSION                           = "v1"                       //注册信息版本
+	GWAF_REG_KEY                               = []byte("5F!vion$k@a7QZ&)") //注册信息加密密钥
+	GWAF_REG_PUBLIC_KEY string                 = ""                         //注册信息加密公钥
+	GWAF_REG_TMP_REG    []byte                                              //用户传来的信息
+)
+
+func GetCurrentVersionInt() int {
+	version, _ := strconv.Atoi(GWAF_RELEASE_VERSION)
+	return version
+}
+
+// GetRealtimeQPS 获取实时QPS (基于差分计算)
+func GetRealtimeQPS() uint64 {
+	return atomic.LoadUint64(&GWAF_CURRENT_REALTIME_QPS)
+}
+
+// GetRealtimeLogQPS 获取实时日志处理QPS (基于差分计算)
+func GetRealtimeLogQPS() uint64 {
+	return atomic.LoadUint64(&GWAF_CURRENT_REALTIME_LOG_QPS)
+}
+
+// GetCumulativeQPS 获取累积QPS (用于统计计算)
+func GetCumulativeQPS() uint64 {
+	return atomic.LoadUint64(&GWAF_RUNTIME_QPS)
+}
+
+// GetCumulativeLogQPS 获取累积日志处理QPS (用于统计计算)
+func GetCumulativeLogQPS() uint64 {
+	return atomic.LoadUint64(&GWAF_RUNTIME_LOG_PROCESS)
+}
+
+// IncrementQPS 增加QPS计数 (只增加累积计数)
+func IncrementQPS() {
+	atomic.AddUint64(&GWAF_RUNTIME_QPS, 1)
+}
+
+// IncrementLogQPS 增加日志处理QPS计数 (只增加累积计数)
+func IncrementLogQPS() {
+	atomic.AddUint64(&GWAF_RUNTIME_LOG_PROCESS, 1)
+}
+
+// NotifyHTTP3ConfigChanged 投递一次 HTTP/3 配置变更信号，让引擎重新对齐 QUIC 监听。
+//
+// cap=1 + select/default：连续多次改动只留一次待处理信号(reconcile 本身幂等)；
+// 且在引擎/主循环尚未就绪时(启动期加载配置)也绝不会阻塞调用方 ——
+// 信号会留在缓冲里，等主循环起来后被消费。
+func NotifyHTTP3ConfigChanged() {
+	select {
+	case GWAF_CHAN_HTTP3 <- 1:
+	default:
+	}
+}
+
+// UpdateRealtimeQPS 更新实时QPS (基于差分计算，定时调用)
+func UpdateRealtimeQPS() {
+	currentTime := time.Now().Unix()
+	currentQPS := atomic.LoadUint64(&GWAF_RUNTIME_QPS)
+	currentLogQPS := atomic.LoadUint64(&GWAF_RUNTIME_LOG_PROCESS)
+
+	lastTime := atomic.LoadInt64(&GWAF_LAST_QPS_TIME)
+	lastQPS := atomic.LoadUint64(&GWAF_LAST_QPS_VALUE)
+	lastLogQPS := atomic.LoadUint64(&GWAF_LAST_LOG_QPS_VALUE)
+
+	// 边界检查和安全计算
+	if lastTime > 0 && currentTime > lastTime {
+		timeDiff := currentTime - lastTime
+
+		// 防止时间差过小导致的计算不准确
+		if timeDiff >= 1 {
+			var realQPS, realLogQPS uint64
+
+			// 安全的差值计算，处理可能的溢出情况
+			if currentQPS >= lastQPS {
+				qpsDiff := currentQPS - lastQPS
+				realQPS = qpsDiff / uint64(timeDiff)
+			} else {
+				// 处理uint64溢出的情况
+				// 当计数器溢出时，使用当前值作为差值的近似
+				realQPS = currentQPS / uint64(timeDiff)
+			}
+
+			if currentLogQPS >= lastLogQPS {
+				logQpsDiff := currentLogQPS - lastLogQPS
+				realLogQPS = logQpsDiff / uint64(timeDiff)
+			} else {
+				// 处理uint64溢出的情况
+				realLogQPS = currentLogQPS / uint64(timeDiff)
+			}
+
+			// 设置合理的QPS上限，防止异常值
+			const MaxReasonableQps = 10000000 // 1000万QPS上限
+			if realQPS > MaxReasonableQps {
+				realQPS = MaxReasonableQps
+			}
+			if realLogQPS > MaxReasonableQps {
+				realLogQPS = MaxReasonableQps
+			}
+
+			atomic.StoreUint64(&GWAF_CURRENT_REALTIME_QPS, realQPS)
+			atomic.StoreUint64(&GWAF_CURRENT_REALTIME_LOG_QPS, realLogQPS)
+			// 留一份采样历史，首页QPS卡片的趋势图直接读内存，不落库
+			AppendQPSSample(currentTime, realQPS)
+		}
+		// 如果时间差小于1秒，保持之前的QPS值不变
+	} else {
+		// 初始化情况或时间异常，设置QPS为0
+		atomic.StoreUint64(&GWAF_CURRENT_REALTIME_QPS, 0)
+		atomic.StoreUint64(&GWAF_CURRENT_REALTIME_LOG_QPS, 0)
+	}
+
+	// 更新记录值
+	atomic.StoreUint64(&GWAF_LAST_QPS_VALUE, currentQPS)
+	atomic.StoreUint64(&GWAF_LAST_LOG_QPS_VALUE, currentLogQPS)
+	atomic.StoreInt64(&GWAF_LAST_QPS_TIME, currentTime)
+}
+
+// GetIPTagDB 根据配置获取IP标签数据库连接
+func GetIPTagDB() *gorm.DB {
+	if GDATA_IP_TAG_DB == 1 {
+		return GWAF_LOCAL_STATS_DB // 使用统计数据库
+	}
+	return GWAF_LOCAL_DB // 默认使用主数据库
+}

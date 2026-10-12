@@ -1,0 +1,705 @@
+<template>
+  <div>
+    <t-card class="list-card-container">
+      <t-row justify="space-between">
+        <div class="left-operation-container">
+          <t-button @click="handleAddIpWhite"> {{ $t('page.ipallow.button_add_ip') }} </t-button>
+          <t-button 
+            theme="danger" 
+            variant="outline" 
+            @click="handleBatchDelete"
+            :disabled="selectedRowKeys.length === 0"
+          >
+            {{ $t('page.ipallow.button_batch_delete') }}
+          </t-button>
+          <t-button 
+            theme="danger" 
+            :disabled="data.length === 0"
+            @click="handleClearAll"
+          >
+            {{ $t('page.ipallow.button_clear_all') }}
+          </t-button>
+        </div>
+        <div class="right-operation-container">
+          <t-form ref="form" :data="searchformData" :label-width="80" layout="inline" colon :style="{ marginBottom: '8px' }">
+            <t-form-item :label="$t('page.ipallow.label_website')" name="host_code">
+              <t-select v-model="searchformData.host_code" clearable filterable :style="{ width: '150px' }">
+                <t-option v-for="(item, index) in host_dic" :value="index" :label="item" :key="index">
+                  {{ item }}
+                </t-option>
+              </t-select>
+            </t-form-item>
+            <t-form-item :label="$t('page.ipallow.label_ip')" name="ip">
+              <t-input v-model="searchformData.ip" class="search-input" :placeholder="$t('common.placeholder')" clearable>
+              </t-input>
+            </t-form-item>
+            <t-form-item>
+              <t-button theme="primary" :style="{ marginLeft: '8px' }" @click="getList('all')">
+                {{ $t('common.search') }}
+              </t-button>
+            </t-form-item>
+          </t-form>
+
+        </div>
+      </t-row>
+      <help-block :summary="$t('page.ipallow.alert_message')" doc="guide/IPWhite" />
+      <div class="table-container">
+        <t-table :columns="columns" :data="data" :rowKey="rowKey" :verticalAlign="verticalAlign" :hover="hover"
+          :pagination="pagination" :selected-row-keys="selectedRowKeys" :loading="dataLoading"
+          @page-change="rehandlePageChange" @change="rehandleChange" @select-change="rehandleSelectChange"
+          :headerAffixedTop="true" :headerAffixProps="{ offsetTop: offsetTop, container: getContainer }">
+
+         <template #host_code="{ row }">
+            <span> {{host_dic[row.host_code]}}</span>
+          </template>
+          <template #ip_type="{ row }">
+            <t-tag v-if="row.ip_type === 'group'" theme="primary" variant="light">
+              {{ $t('page.ipallow.entry_type_group') }}
+            </t-tag>
+            <span v-else>{{ $t('page.ipallow.entry_type_ip') }}</span>
+          </template>
+          <template #ip="{ row }">
+            <span v-if="row.ip_type === 'group'">{{ groupLabel(row.group_code) }}</span>
+            <span v-else>{{ row.ip }}</span>
+          </template>
+
+          <template #op="slotProps">
+            <a class="t-button-link" @click="handleClickEdit(slotProps)">{{ $t('common.edit') }}</a>
+            <a class="t-button-link" @click="handleClickDelete(slotProps)">{{ $t('common.delete') }}</a>
+          </template>
+        </t-table>
+      </div>
+      <div>
+      <router-view></router-view>
+      </div>
+    </t-card>
+
+
+    <t-dialog :header="$t('common.new')" :visible.sync="addFormVisible" :width="680" :footer="false">
+      <div slot="body">
+        <t-form :data="formData" ref="form" :rules="rules" @submit="onSubmit" :labelWidth="100">
+          <t-form-item :label="$t('page.ipallow.label_website')" name="host_code">
+            <t-select v-model="formData.host_code" clearable filterable :style="{ width: '480px' }">
+              <t-option v-for="(item, index) in host_dic" :value="index" :label="item"
+                :key="index">
+                {{ item }}
+              </t-option>
+            </t-select>
+          </t-form-item>
+          <t-form-item :label="$t('page.ipallow.label_entry_type')" name="ip_type">
+            <t-radio-group v-model="formData.ip_type">
+              <t-radio-button value="ip">{{ $t('page.ipallow.entry_type_ip') }}</t-radio-button>
+              <t-radio-button value="group">{{ $t('page.ipallow.entry_type_group') }}</t-radio-button>
+            </t-radio-group>
+          </t-form-item>
+          <t-form-item v-if="formData.ip_type !== 'group'" :label="$t('page.ipallow.label_ip')" name="ip">
+            <t-input :style="{ width: '480px' }" v-model="formData.ip"
+              :placeholder="$t('page.ipallow.ip_placeholder')"></t-input>
+            <div class="form-tips">{{ $t('page.ipallow.ip_pattern_tips') }}</div>
+          </t-form-item>
+          <t-form-item v-else :label="$t('page.ipallow.label_group')" name="group_code">
+            <t-select v-model="formData.group_code" clearable filterable :style="{ width: '480px' }">
+              <t-option v-for="g in group_options" :key="g.group_code" :value="g.group_code"
+                :label="g.group_name + ' (' + g.item_count + ')'"></t-option>
+            </t-select>
+            <a class="t-button-link" style="margin-left:8px" @click="$router.push({ name: 'WafIpGroup' })">
+              {{ $t('page.ipallow.goto_group_manage') }}
+            </a>
+          </t-form-item>
+          <t-form-item :label="$t('common.remarks')" name="remarks">
+            <t-textarea :style="{ width: '480px' }" v-model="formData.remarks"  name="remarks">
+            </t-textarea>
+          </t-form-item>
+          <t-form-item style="float: right">
+            <t-button variant="outline" @click="onClickCloseBtn">{{ $t('common.close') }}</t-button>
+            <t-button theme="primary" type="submit">{{ $t('common.confirm') }}</t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+    </t-dialog>
+
+    <t-dialog :header="$t('common.edit')" :visible.sync="editFormVisible" :width="680" :footer="false">
+      <div slot="body">
+        <t-form :data="formEditData" ref="form" :rules="editRules" @submit="onSubmitEdit" :labelWidth="100">
+          <t-form-item :label="$t('page.ipallow.label_website')"  name="host_code">
+            <t-select v-model="formEditData.host_code" clearable filterable :style="{ width: '480px' }">
+              <t-option v-for="(item, index) in host_dic" :value="index" :label="item"
+                :key="index">
+                {{ item }}
+              </t-option>
+            </t-select>
+          </t-form-item>
+          <t-form-item :label="$t('page.ipallow.label_entry_type')" name="ip_type">
+            <t-radio-group v-model="formEditData.ip_type">
+              <t-radio-button value="ip">{{ $t('page.ipallow.entry_type_ip') }}</t-radio-button>
+              <t-radio-button value="group">{{ $t('page.ipallow.entry_type_group') }}</t-radio-button>
+            </t-radio-group>
+          </t-form-item>
+          <t-form-item v-if="formEditData.ip_type !== 'group'" :label="$t('page.ipallow.label_ip')" name="ip">
+            <t-input :style="{ width: '480px' }" v-model="formEditData.ip"
+              :placeholder="$t('page.ipallow.ip_placeholder')"></t-input>
+            <div class="form-tips">{{ $t('page.ipallow.ip_pattern_tips') }}</div>
+          </t-form-item>
+          <t-form-item v-else :label="$t('page.ipallow.label_group')" name="group_code">
+            <t-select v-model="formEditData.group_code" clearable filterable :style="{ width: '480px' }">
+              <t-option v-for="g in group_options" :key="g.group_code" :value="g.group_code"
+                :label="g.group_name + ' (' + g.item_count + ')'"></t-option>
+            </t-select>
+          </t-form-item>
+          <t-form-item :label="$t('common.remarks')" name="remarks">
+            <t-textarea :style="{ width: '480px' }" v-model="formEditData.remarks"  name="remarks">
+            </t-textarea>
+          </t-form-item>
+          <t-form-item style="float: right">
+            <t-button variant="outline" @click="onClickCloseEditBtn">{{ $t('common.close') }}</t-button>
+            <t-button theme="primary" type="submit">{{ $t('common.confirm') }}</t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+    </t-dialog>
+
+    <t-dialog :header="$t('common.confirm_delete')" :body="confirmBody" :visible.sync="confirmVisible" @confirm="onConfirmDelete"
+      :onCancel="onCancel">
+    </t-dialog>
+    <t-dialog 
+      :header="$t('page.ipallow.confirm_batch_delete')" 
+      :visible.sync="batchDeleteVisible" 
+      @confirm="onConfirmBatchDelete"
+      @cancel="onCancelBatchDelete"
+    >
+      <div slot="body">
+        {{ $t('page.ipallow.confirm_batch_delete') }}
+      </div>
+    </t-dialog>
+
+    <t-dialog 
+      :header="$t('page.ipallow.confirm_clear_all')" 
+      :visible.sync="clearAllVisible" 
+      @confirm="onConfirmClearAll"
+      @cancel="onCancelClearAll"
+    >
+      <div slot="body">
+        {{ $t('page.ipallow.confirm_clear_all') }}
+      </div>
+    </t-dialog>
+  </div>
+</template>
+<script lang="ts">
+  import Vue from 'vue';
+  import {
+    SearchIcon
+  } from 'tdesign-icons-vue';
+  import Trend from '@/components/trend/index.vue';
+  import {
+    prefix
+  } from '@/config/global';
+  import {
+    allhost
+  } from '@/apis/host';
+
+  import {
+    wafIPWhiteListApi,wafIPWhiteDelApi,wafIPWhiteEditApi,wafIPWhiteAddApi,wafIPWhiteDetailApi,
+    wafIPWhiteBatchDelApi,wafIPWhiteDelAllApi
+  } from '@/apis/ipwhite';
+  import {
+    SSL_STATUS,
+    GUARD_STATUS,
+    CONTRACT_STATUS,
+    CONTRACT_STATUS_OPTIONS,
+    CONTRACT_TYPES,
+    CONTRACT_PAYMENT_TYPES
+  } from '@/constants';
+
+  import {
+    wafIPGroupOptionsApi
+  } from '@/apis/ipgroup';
+
+  const INITIAL_DATA = {
+    host_code: '',
+    ip: '',
+    remarks: '',
+    ip_type: 'ip',
+    group_code: '',
+  };
+  export default Vue.extend({
+    name: 'ListBase',
+    components: {
+      SearchIcon,
+      Trend,
+    },
+    data() {
+      return {
+        addFormVisible: false,
+        editFormVisible: false,
+        guardVisible: false,
+        confirmVisible: false,
+        batchDeleteVisible: false,
+        clearAllVisible: false,
+        formData: {
+          ...INITIAL_DATA
+        },
+        formEditData: {
+          ...INITIAL_DATA
+        },
+        // 新增与编辑各用一份校验规则：两个弹窗共用同一份时，
+        // 依赖 ip_type 的条件校验会读到另一个弹窗的表单值而误判
+        rules: {
+          host_code: [{
+            required: true,
+            message: this.$t('common.placeholder')+this.$t('page.ipallow.label_website'),
+            type: 'error'
+          }],
+          ip: [{
+            validator: (val) => this.formData.ip_type === 'group' || !!val,
+            message: this.$t('common.placeholder')+this.$t('page.ipallow.label_ip'),
+            type: 'error'
+          }],
+          group_code: [{
+            validator: (val) => this.formData.ip_type !== 'group' || !!val,
+            message: this.$t('common.placeholder')+this.$t('page.ipallow.label_group'),
+            type: 'error'
+          }],
+        },
+        editRules: {
+          host_code: [{
+            required: true,
+            message: this.$t('common.placeholder')+this.$t('page.ipallow.label_website'),
+            type: 'error'
+          }],
+          ip: [{
+            validator: (val) => this.formEditData.ip_type === 'group' || !!val,
+            message: this.$t('common.placeholder')+this.$t('page.ipallow.label_ip'),
+            type: 'error'
+          }],
+          group_code: [{
+            validator: (val) => this.formEditData.ip_type !== 'group' || !!val,
+            message: this.$t('common.placeholder')+this.$t('page.ipallow.label_group'),
+            type: 'error'
+          }],
+        },
+        //IP组下拉选项
+        group_options: [],
+        textareaValue: '',
+        prefix,
+        dataLoading: false,
+        data: [], //列表数据信息
+        detail_data: [], //加载详情信息用于编辑
+        selectedRowKeys: [],
+        value: 'first',
+        columns: [
+           { colKey: 'row-select', type: 'multiple', width: 64, fixed: 'left' },
+          {
+            title: this.$t('page.ipallow.label_website'),
+            align: 'left',
+            width: 250,
+            ellipsis: true,
+            colKey: 'host_code',
+            fixed: 'left',
+          },
+          {
+            title: this.$t('page.ipallow.col_entry_type'),
+            width: 110,
+            colKey: 'ip_type',
+          },
+          {
+            title: this.$t('page.ipallow.label_ip'),
+            width: 200,
+            ellipsis: true,
+            colKey: 'ip',
+          },
+          {
+            title: this.$t('common.remarks'),
+            width: 200,
+            ellipsis: true,
+            colKey: 'remarks',
+          },
+          {
+            title: this.$t('common.create_time'),
+            width: 200,
+            ellipsis: true,
+            colKey: 'create_time',
+          },
+
+          {
+            align: 'left',
+            fixed: 'right',
+            width: 200,
+            colKey: 'op',
+            title: this.$t('common.op'),
+          },
+        ],
+        rowKey: 'id',
+        tableLayout: 'auto',
+        verticalAlign: 'top',
+        hover: true,
+        rowClassName: (rowKey: string) => `${rowKey}-class`,
+        // 与pagination对齐
+        pagination: {
+          total: 0,
+          current: 1,
+          pageSize: 10
+        },
+        //顶部搜索
+        searchformData: {
+          ip:"",
+          host_code:""
+        },
+        //索引区域
+        deleteIdx: -1,
+        guardStatusIdx :-1,
+        //主机字典
+        host_dic:{}
+      };
+    },
+    computed: {
+      confirmBody() {
+        if (this.deleteIdx > -1) {
+          const {
+            host
+          } = this.data?. [this.deleteIdx];
+          return this.$t('common.data_delete_warning');
+        }
+        return '';
+      },
+      offsetTop() {
+        return this.$store.state.setting.isUseTabsRouter ? 48 : 0;
+      },
+    },
+    mounted() {
+      this.loadHostList().then(() => {
+        this.getList("");
+      });
+      this.loadGroupOptions();
+    },
+
+    methods: {
+      loadGroupOptions() {
+        let that = this
+        wafIPGroupOptionsApi()
+          .then((res) => {
+            if (res.code === 0) {
+              that.group_options = res.data ?? [];
+            }
+          })
+          .catch((e: Error) => { console.log(e); });
+      },
+      // 列表里组引用行显示「组名(条目数)」；组已被删时退回显示短码
+      groupLabel(groupCode) {
+        const g = (this.group_options || []).find((x) => x.group_code === groupCode);
+        return g ? g.group_name + ' (' + g.item_count + ')' : groupCode;
+      },
+      loadHostList() {
+        return new Promise((resolve, reject) => {
+          allhost()
+            .then((res) => {
+              let resdata = res;
+              console.log(resdata);
+              if (resdata.code === 0) {
+                let host_options = resdata.data;
+                for (let i = 0; i < host_options.length; i++) {
+                  this.host_dic[host_options[i].value] = host_options[i].label;
+                }
+              }
+              resolve(); // 调用 resolve 表示加载完成
+            })
+            .catch((e: Error) => {
+              console.log(e);
+              reject(e); // 调用 reject 表示加载失败
+            });
+        });
+      },
+      getList(keyword) {
+        let that = this
+        wafIPWhiteListApi( {
+              pageSize: that.pagination.pageSize,
+              pageIndex: that.pagination.current,
+              ...that.searchformData
+          })
+          .then((res) => {
+            let resdata = res
+            console.log(resdata)
+            if (resdata.code === 0) {
+
+              this.data = resdata.data.list??[];
+              this.data_attach = []
+              console.log('getList',this.data)
+              this.pagination = {
+                ...this.pagination,
+                total: resdata.data.total,
+              };
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+          })
+          .finally(() => {
+            this.dataLoading = false;
+          });
+        this.dataLoading = true;
+      },
+      getContainer() {
+        return document.querySelector('.tdesign-starter-layout');
+      },
+      rehandlePageChange(curr, pageInfo) {
+        this.pagination.current = curr.current
+        if (this.pagination.pageSize != curr.pageSize) {
+          this.pagination.current = 1
+          this.pagination.pageSize = curr.pageSize
+        }
+        this.getList("")
+      },
+      rehandleSelectChange(selectedRowKeys: number[]) {
+        this.selectedRowKeys = selectedRowKeys;
+      },
+      rehandleChange(changeParams, triggerAndData) {
+      },
+      handleClickEdit(e) {
+        console.log(e)
+        const {
+          id
+        } = e.row
+        console.log(id)
+        this.editFormVisible = true
+        this.getDetail(id)
+      },
+      handleAddIpWhite() {
+        this.addFormVisible = true
+        this.formData = {...INITIAL_DATA};
+        this.loadGroupOptions();
+      },
+      onSubmit({
+        result,
+        firstError
+      }): void {
+        let that = this
+        if (!firstError) {
+
+          let postdata = {
+            ...that.formData
+          }
+          wafIPWhiteAddApi({...postdata})
+            .then((res) => {
+              let resdata = res
+              console.log(resdata)
+              if (resdata.code === 0) {
+                that.$message.success(resdata.msg);
+                that.addFormVisible = false;
+                that.pagination.current = 1
+                that.getList("")
+              } else {
+                that.$message.warning(resdata.msg);
+              }
+            })
+            .catch((e: Error) => {
+              console.log(e);
+            })
+            .finally(() => {});
+        } else {
+          console.log('Errors: ', result);
+          that.$message.warning(firstError);
+        }
+      },
+      onSubmitEdit({
+        result,
+        firstError
+      }): void {
+        let that = this
+        if (!firstError) {
+
+          let postdata = {
+            ...that.formEditData
+          }
+          wafIPWhiteEditApi({...postdata})
+            .then((res) => {
+              let resdata = res
+              console.log(resdata)
+              if (resdata.code === 0) {
+                that.$message.success(resdata.msg);
+                that.editFormVisible = false;
+                that.getList("")
+              } else {
+                that.$message.warning(resdata.msg);
+              }
+            })
+            .catch((e: Error) => {
+              console.log(e);
+            })
+            .finally(() => {});
+        } else {
+          console.log('Errors: ', result);
+          that.$message.warning(firstError);
+        }
+      },
+      onClickCloseBtn(): void {
+        this.addFormVisible = false;
+        this.formData = {...INITIAL_DATA};
+      },
+      onClickCloseEditBtn(): void {
+        this.editFormVisible = false;
+        this.formEditData = {...INITIAL_DATA};
+      },
+      handleClickDelete(row) {
+        console.log(row)
+        this.deleteIdx = row.rowIndex;
+        this.confirmVisible = true;
+      },
+      onConfirmDelete() {
+        this.confirmVisible = false;
+        console.log('delete', this.data)
+        console.log('delete', this.data[this.deleteIdx])
+        let {
+          id
+        } = this.data[this.deleteIdx]
+        let that = this
+        wafIPWhiteDelApi({
+              id: id
+          })
+          .then((res) => {
+            let resdata = res
+            console.log(resdata)
+            if (resdata.code === 0) {
+
+              that.getList("")
+              that.$message.success(resdata.msg);
+            } else {
+              that.$message.warning(resdata.msg);
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+          })
+          .finally(() => {});
+
+
+        this.resetIdx();
+      },
+      onCancel() {
+        this.resetIdx();
+      },
+      resetIdx() {
+        this.deleteIdx = -1;
+      },
+      getDetail(id) {
+        let that = this
+        wafIPWhiteDetailApi({
+              id: id
+          })
+          .then((res) => {
+            let resdata = res
+            console.log(resdata)
+            if (resdata.code === 0) {
+              that.detail_data = resdata.data;
+              that.formEditData = {
+                ...that.detail_data,
+                //存量记录的 ip_type 是空串，等价于「单条IP」
+                ip_type: that.detail_data.ip_type || 'ip',
+                group_code: that.detail_data.group_code || '',
+              }
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+          })
+          .finally(() => {});
+      },
+            handleBatchDelete() {
+        if (this.selectedRowKeys.length === 0) {
+          this.$message.warning(this.$t('page.ipallow.no_data_selected'));
+          return;
+        }
+        this.batchDeleteVisible = true;
+      },
+      
+      handleClearAll() { 
+        this.clearAllVisible = true;
+      },
+      
+      onConfirmBatchDelete() {
+        this.batchDeleteVisible = false;
+        const that = this;
+        const ids = this.selectedRowKeys.map(key => {
+          const item = this.data.find(d => d.id === key);
+          return item ? item.id : null;
+        }).filter(id => id !== null);
+        
+        wafIPWhiteBatchDelApi({ ids: ids })
+          .then((res) => {
+            const resdata = res;
+            console.log(resdata);
+            if (resdata.code === 0) {
+              that.getList("");
+              that.selectedRowKeys = [];
+              that.$message.success(that.$t('page.ipallow.batch_delete_success'));
+            } else {
+              that.$message.warning(resdata.msg);
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+            that.$message.error('批量删除失败');
+          })
+          .finally(() => {});
+      },
+      
+      onConfirmClearAll() {
+        this.clearAllVisible = false;
+        const that = this;
+        
+        wafIPWhiteDelAllApi({ host_code: this.searchformData.host_code })
+          .then((res) => {
+            const resdata = res;
+            console.log(resdata);
+            if (resdata.code === 0) {
+              that.getList("");
+              that.selectedRowKeys = [];
+              that.$message.success(that.$t('page.ipallow.clear_all_success'));
+            } else {
+              that.$message.warning(resdata.msg);
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+            that.$message.error('清空失败');
+          })
+          .finally(() => {});
+      },
+      
+      onCancelBatchDelete() {
+        this.batchDeleteVisible = false;
+      },
+      
+      onCancelClearAll() {
+        this.clearAllVisible = false;
+      },
+    },
+  });
+</script>
+
+<style lang="less" scoped>
+  @import '@/style/variables';
+
+  .left-operation-container {
+    padding: 0 0 6px 0;
+    margin-bottom: 16px;
+
+    .selected-count {
+      display: inline-block;
+      margin-left: 8px;
+      color: var(--td-text-color-secondary);
+    }
+  }
+
+  .form-tips {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--td-text-color-secondary);
+  }
+
+  .search-input {
+    width: 360px;
+  }
+
+  .t-button+.t-button {
+    margin-left: @spacer;
+  }
+</style>

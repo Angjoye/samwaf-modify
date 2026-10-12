@@ -1,0 +1,88 @@
+package router
+
+type ApiGroup struct {
+	HostRouter
+	LogRouter
+	RuleRouter
+	EngineRouter
+	StatRouter
+	AllowIpRouter
+	AllowUrlRouter
+	LdpUrlRouter
+	AntiCCRouter
+	AntiCCRuleRouter
+	IPFailureRouter
+	BlockIpRouter
+	HostGroupRouter
+	IPGroupRouter
+	AccessAccountRouter
+	AccessConfigRouter
+	AccessSessionRouter
+	AccessAuditRouter
+	IPGroupItemRouter
+	BlockUrlRouter
+	AccountRouter
+	AccountLogRouter
+	LoginHistoryRouter
+	LoginOutRouter
+	SysLogRouter
+	WebSocketRouter
+	WebSysInfoRouter
+	SystemConfigRouter
+	WafCommonRouter
+	OneKeyModRouter
+	WafLicenseRouter
+	SensitiveRouter
+	LoadBalanceRouter
+	SslConfigRouter
+	BatchTaskRouter
+	SslOrderRouter
+	WafSslExpireRouter
+	WafHttpAuthBaseRouter
+	WafHttpAuthSessionRouter
+	WafTaskRouter
+	WafBlockingPageRouter
+	WafGPTRouter
+	WafOtpRouter
+	AnalysisRouter
+	WafPrivateInfoRouter
+	WafPrivateGroupRouter
+	WafCacheRuleRouter
+	WafTamperRuleRouter
+	WafTunnelRouter
+	WafVpConfigRouter
+	WafFileRouter
+	WafSystemMonitorRouter
+	WafDiagnosticRouter
+	WafCaServerInfoRouter
+	SqlQueryRouter
+	NotifyChannelRouter
+	NotifySubscriptionRouter
+	NotifyLogRouter
+	FirewallIPBlockRouter
+	HostGuardRouter
+	HostConnRouter
+	ThreatIPRouter
+	CDNIPRouter
+	IPLookupRouter
+	PluginRouter
+	LogFileWriteRouter
+	IPLocationRouter
+	WafOPlatformKeyRouter
+	WafOPlatformLogRouter
+	WafOPlatformDocRouter
+	WafDataRetentionRouter
+	WafOwaspRouter
+	WafHostPathRuleRouter
+	WafAppRouter
+	WafAIRouter
+	WafUIPreferenceRouter
+	UpgradeNoticeRouter
+}
+type PublicApiGroup struct {
+	LoginRouter
+	SecKeyRouter
+}
+
+var ApiGroupApp = new(ApiGroup)
+var PublicApiGroupApp = new(PublicApiGroup)

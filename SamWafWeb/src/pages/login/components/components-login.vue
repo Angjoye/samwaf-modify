@@ -1,0 +1,265 @@
+<template>
+  <t-form
+    ref="form"
+    :class="['item-container', `login-${type}`]"
+    :data="formData"
+    :rules="FORM_RULES"
+    label-width="0"
+    @submit="onSubmit"
+  >
+    <!-- 登录失败的原因就摆在表单上方（视线必经之路），不再飘到右上角去。
+         同一时刻只留一条，新的覆盖旧的 -->
+    <t-alert v-if="loginError" theme="error" :message="loginError" class="login-error-tip" close @close="loginError = ''" />
+    <template v-if="type == 'password'">
+      <t-form-item name="lang" label="语言选择">
+        <t-select  v-model="langValue"
+                   placeholder="SelectLanguage"
+                   @change="changeLangEvent"  size="large"  title="Select Language">
+          <t-option  v-for="(item, index) in langOptions"
+                     :key="index"
+                     :label="item.label"
+                     :value="item.value"/>
+        </t-select>
+      </t-form-item>
+      <t-form-item name="account">
+        <t-input v-model="formData.account" size="large" :placeholder="$t('login.input_account_placeholder')">
+          <template #prefix-icon>
+            <user-icon />
+          </template>
+        </t-input>
+      </t-form-item>
+
+      <t-form-item name="password">
+        <t-input
+          v-model="formData.password"
+          size="large"
+          :type="showPsw ? 'text' : 'password'"
+          clearable
+          key="password"
+          :placeholder="$t('login.input_password_placeholder')"
+        >
+          <template #prefix-icon>
+            <lock-on-icon />
+          </template>
+          <template #suffix-icon>
+            <browse-icon v-if="showPsw" @click="showPsw = !showPsw" key="browse" />
+            <browse-off-icon v-else @click="showPsw = !showPsw" key="browse-off" />
+          </template>
+        </t-input>
+      </t-form-item>
+      <t-form-item name="secretCode" v-if="showSecretCode">
+        <!-- 安全码是 2FA，不能被浏览器塞进登录口令；账号/密码框的自动填充保持不动 -->
+        <t-input v-model="formData.secret_code" size="large" :type="'password'"  clearable  autocomplete="one-time-code" :placeholder="$t('login.input_secret_code_placeholder')" >
+          <template #prefix-icon>
+            <lock-on-icon />
+          </template>
+        </t-input>
+
+      </t-form-item>
+
+    </template>
+
+    <t-form-item v-if="type !== 'qrcode'" class="btn-container">
+      <t-button block size="large" type="submit"> {{ $t('login.login_btn_title') }} </t-button>
+    </t-form-item>
+
+    <!-- 首次登录/口令到期 强制改密弹窗 -->
+    <change-password-dialog
+      :visible.sync="showChangePwd"
+      :forced="true"
+      :reason="changePwdReason"
+      :preset-old-password="formData.password"
+      @success="onChangePwdSuccess"
+    />
+  </t-form>
+</template>
+<script lang="ts">
+import i18n from '@/i18n'; // 确保导入全局 i18n 实例
+import Vue from 'vue';
+import QrcodeVue from 'qrcode.vue';
+import { UserIcon, LockOnIcon, BrowseOffIcon, BrowseIcon, RefreshIcon } from 'tdesign-icons-vue';
+import { loginapi } from '@/apis/login';
+import { takeLogoutReason } from '@/utils/localnotice';
+import { getSafeRedirectUrl } from '@/constants';
+import ChangePasswordDialog from '@/pages/waf/account/components/ChangePasswordDialog.vue';
+const INITIAL_DATA = {
+  phone: '',
+  account: '',
+  password: '',
+  verifyCode: '',
+  secret_code: '',
+  checked: false,
+};
+
+const FORM_RULES = {
+  phone: [{ required: true, message: i18n.t('login.rule.phone') , type: 'error' }],
+  account: [{ required: true, message: i18n.t('login.rule.account') , type: 'error' }],
+  password: [{ required: true, message: i18n.t('login.rule.password') , type: 'error' }],
+  verifyCode: [{ required: true, message: i18n.t('login.rule.verifyCode') , type: 'error' }],
+};
+/** 高级详情 */
+export default Vue.extend({
+  name: 'Login',
+  components: {
+    QrcodeVue,
+    UserIcon,
+    LockOnIcon,
+    BrowseOffIcon,
+    BrowseIcon,
+    RefreshIcon,
+    ChangePasswordDialog,
+  },
+  data() {
+    return {
+      loginError: '',
+      FORM_RULES,
+      type: 'password',
+      formData: { ...INITIAL_DATA },
+      showPsw: false,
+      showSecretCode: false,
+      countDown: 0,
+      intervalTimer: null,
+      /**强制改密**/
+      showChangePwd: false,
+      changePwdReason: '',
+      /**语言问题**/
+      langValue:"zh_CN",
+      langOptions: [
+        {
+          value: "zh_CN",
+          label: "中文"
+        },
+        {
+          value: "en_US",
+          label: "English"
+        },
+      ]
+    };
+  },
+  beforeDestroy() {
+    clearInterval(this.intervalTimer);
+  },
+  mounted() {
+    // 被踢回登录页时告诉用户一次「为什么」——右上角那一串回声已被抑制，
+    // 但「登录状态已失效」这条本身是有信息量的，摆在表单上方说一次
+    const reason = takeLogoutReason();
+    if (reason === 'auth') {
+      this.loginError = this.$t('login.session_expired');
+    }
+    this.init()
+  },
+  methods: {
+    //init
+    init(){
+      //多语言
+      this.langValue = localStorage.getItem("lang") || "zh_CN"
+    },
+    // 切换语言
+    changeLangEvent(value, context) {
+      switch (value) {
+        case "zh_CN":
+          this.langValue = value;
+          this.$i18n.locale = this.langValue;
+          localStorage.setItem("lang",this.langValue)
+          break;
+        case "en_US":
+          this.langValue = value;
+          this.$i18n.locale = this.langValue;
+          localStorage.setItem("lang",this.langValue)
+          break;
+        default:
+          break;
+      }
+      //location.reload(); // 刷新页面
+    },
+    switchType(val) {
+      this.type = val;
+      this.$refs.form.reset();
+    },
+    onSubmit({ validateResult }) {
+      if (validateResult === true) {
+        loginapi({
+          login_account: this.formData.account,
+          login_password: this.formData.password,
+          login_otp_secret_code: this.formData.secret_code
+        })
+        .then((res) => {
+          console.log(res);
+          this.loginError = '';
+          if (res.code == 0) {
+            localStorage.setItem("access_token", res.data.access_token);
+            localStorage.setItem("current_account", this.formData.account);
+
+            // 登录来源提醒：进入布局后由 layouts/index.vue 在右下角弹出。
+            // 这里就存下来（而不是等进系统再查接口），是因为「上次登录」在本次登录写库后就被覆盖了，
+            // 只有登录响应这一刻拿得到。放 sessionStorage：关掉标签页就没了，不会下次打开还弹旧的。
+            if (res.data.login_notice) {
+              sessionStorage.setItem("login_notice", JSON.stringify(res.data.login_notice));
+            }
+
+            // 首次登录/口令到期：强制改密，改密成功后再进入系统
+            // 注意：改密前不要触发受服务端"强制改密门"拦截的接口(如 fetchParams)，否则会拿到 -4
+            if (res.data.need_change_password) {
+              this.changePwdReason = res.data.change_password_reason || '';
+              this.showChangePwd = true;
+              return;
+            }
+
+            this.$store.dispatch('user/login', this.formData);
+            this.$store.dispatch('sysparams/fetchParams');
+            this.$message.success(this.$t('login.login_success'));
+
+            setTimeout(() => {
+              // 获取安全的重定向URL
+              const redirectUrl = getSafeRedirectUrl();
+              console.log('重定向到:', redirectUrl);
+
+              // 安全跳转
+              this.$router.replace(redirectUrl).catch(() => '');
+            }, 1000);
+
+          } else if (res.code == -2) {
+            this.showSecretCode = true;
+            this.formData.secretCode = "";
+            this.loginError = res.msg;
+          } else {
+            this.loginError = res.msg;
+          }
+        })
+        .catch((err) => {
+          console.log(err);
+          // 连不上后端 / 超时：登录页没有铃铛可收，直接摆在表单上方
+          this.loginError = this.$t('login.login_request_failed');
+        });
+      }
+    },
+    // 强制改密成功后再加载受保护的系统参数并进入系统（此时服务端已清除令牌的强制改密标记）
+    onChangePwdSuccess() {
+      this.$store.dispatch('user/login', this.formData);
+      this.$store.dispatch('sysparams/fetchParams');
+      this.$message.success(this.$t('login.login_success'));
+      setTimeout(() => {
+        const redirectUrl = getSafeRedirectUrl();
+        this.$router.replace(redirectUrl).catch(() => '');
+      }, 800);
+    },
+    handleCounter() {
+      this.countDown = 60;
+      this.intervalTimer = setInterval(() => {
+        if (this.countDown > 0) {
+          this.countDown -= 1;
+        } else {
+          clearInterval(this.intervalTimer);
+          this.countDown = 0;
+        }
+      }, 1000);
+    },
+  },
+});
+</script>
+
+<style scoped>
+.login-error-tip {
+  margin-bottom: 16px;
+}
+</style>

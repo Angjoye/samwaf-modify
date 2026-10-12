@@ -1,0 +1,38 @@
+/vue/
+/release/
+/vue/dist/
+/conf/*
+/data/*
+/wafenginecore/data/
+/data/local_log.db
+/data/local_stats.db
+/data/local.db
+/data/local_log.db-shm
+/data/local_log.db-wal
+/data/local_stats.db-shm
+/data/local_stats.db-wal
+registration_data.bin
+dist/
+.idea/
+!/public/dist/.gitkeep
+/logs/*
+/ssl/
+/codetemplete/output/*
+/conf/config.yml
+*.log
+*.exe
+/.trae/
+/.cursor/
+/.claude/
+/.agents/
+/AGENTS.md
+/docs/openapi/
+/.data/
+
+# go test ./wafsec/ 的产物：wafsec/rsa.go 的 GenRsaKey 按相对路径写在包目录下，
+# 跑完测试就会多出这两个文件。私钥绝不能进仓库，这里直接挡掉。
+# 只挡 wafsec/ 下这两个固定文件名，不影响内嵌资源 cmd/samwaf/exedata/public_key.pem。
+/wafsec/private_key.pem
+/wafsec/public_key.pem
+/wafinit/testdata
+/download/

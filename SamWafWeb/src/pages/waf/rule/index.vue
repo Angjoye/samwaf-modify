@@ -1,0 +1,670 @@
+<template>
+  <div>
+    <t-card class="list-card-container">
+      <!-- 操作区：左侧增删操作 + 右侧编排模式(配置入口) -->
+      <div class="rule-toolbar-actions">
+        <div class="left-operation-container">
+          <t-button @click="handleAddRule"> {{ $t('page.rule.button_add_rule') }} </t-button>
+          <t-button
+            theme="danger"
+            variant="outline"
+            @click="handleBatchDelete"
+            :disabled="selectedRowKeys.length === 0"
+          >
+            {{ $t('page.rule.button_batch_delete') }}
+          </t-button>
+          <t-button
+            theme="danger"
+            :disabled="data.length === 0"
+            @click="handleClearAll"
+          >
+            {{ $t('page.rule.button_clear_all') }}
+          </t-button>
+        </div>
+        <t-button theme="primary" variant="outline" class="chain-mode-btn" @click="openChainMode">
+          <template #icon><swap-icon /></template>
+          {{ $t('page.rule.chain_mode.entry') }}
+        </t-button>
+      </div>
+
+      <!-- 筛选区：单独一行 -->
+      <div class="rule-toolbar-search">
+        <t-form ref="form" :data="searchformData" :label-width="70" layout="inline" colon>
+          <t-form-item :label="$t('page.rule.label_website')" name="host_code">
+            <t-select v-model="searchformData.host_code" clearable filterable :style="{ width: '150px' }">
+              <t-option v-for="(item, index) in host_dic" :value="index" :label="item" :key="index">
+                {{ item }}
+              </t-option>
+            </t-select>
+          </t-form-item>
+          <t-form-item :label="$t('page.rule.label_rule_name')" name="rule_name">
+            <t-input v-model="searchformData.rule_name" class="search-input" clearable>
+            </t-input>
+          </t-form-item>
+          <t-form-item :label="$t('page.rule.label_rule_code')" name="rule_code">
+            <t-input v-model="searchformData.rule_code" class="search-input" clearable>
+            </t-input>
+          </t-form-item>
+          <t-form-item>
+            <t-button theme="primary" @click="getList('all')">
+              {{ $t('common.search') }}
+            </t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+
+      <help-block :summary="$t('page.rule.alert_message')" doc="guide/Rule" />
+      <div class="table-container">
+        <t-table
+          :columns="columns"
+             size="small"
+          :data="data"
+          :rowKey="rowKey"
+          :verticalAlign="verticalAlign"
+          :hover="hover"
+          :pagination="pagination"
+          :selected-row-keys="selectedRowKeys"
+          :loading="dataLoading"
+          @page-change="rehandlePageChange"
+          @change="rehandleChange"
+          @select-change="rehandleSelectChange"
+          :headerAffixedTop="true"
+          :headerAffixProps="{ offsetTop: offsetTop, container: getContainer }"
+        ><template #host_code="{ row }">
+            <span> {{host_dic[row.host_code]}}</span>
+          </template>
+          <template #rule_status="{ row }">
+            <t-switch size="small" v-model="row.rule_status === 1" :label="[$t('page.rule.rule_on'), $t('page.rule.rule_off')]"
+                      @change="changeRuleStatus($event, row)">
+            </t-switch>
+          </template>
+
+          <template #op="slotProps">
+            <a class="t-button-link" @click="handleClickEdit(slotProps)">{{ $t('common.edit') }}</a>
+            <a class="t-button-link" @click="handleClickDelete(slotProps)">{{ $t('common.delete') }}</a>
+          </template>
+        </t-table>
+      </div>
+    </t-card>
+
+
+
+    <t-dialog
+      :header="$t('common.confirm_delete')"
+      :body="confirmBody"
+      :visible.sync="confirmVisible"
+      @confirm="onConfirmDelete"
+      :onCancel="onCancel"
+    >
+    </t-dialog>
+    <t-dialog 
+      :header="$t('page.rule.confirm_batch_delete')" 
+      :visible.sync="batchDeleteVisible" 
+      @confirm="onConfirmBatchDelete"
+      @cancel="onCancelBatchDelete"
+    >
+      <div slot="body">
+        {{ $t('page.rule.confirm_batch_delete') }}
+      </div>
+    </t-dialog>
+
+    <t-dialog 
+      :header="$t('page.rule.confirm_clear_all')" 
+      :visible.sync="clearAllVisible" 
+      @confirm="onConfirmClearAll"
+      @cancel="onCancelClearAll"
+    >
+      <div slot="body">
+        {{ $t('page.rule.confirm_clear_all') }}
+      </div>
+    </t-dialog>
+
+    <!-- 规则编排模式设置(rule_chain_mode) -->
+    <t-dialog
+      :header="$t('page.rule.chain_mode.title')"
+      :visible.sync="chainModeVisible"
+      width="640px"
+      :footer="false"
+    >
+      <t-alert theme="info" :message="$t('page.rule.chain_mode.intro')" style="margin-bottom: 12px;" />
+      <t-radio-group v-model="chainMode" class="chain-mode-group">
+        <div class="chain-mode-item" v-for="opt in chainModeOptions" :key="opt.value" @click="chainMode = opt.value">
+          <t-radio :value="opt.value">
+            <span class="chain-mode-label">{{ opt.label }}</span>
+            <t-tag v-if="opt.recommend" theme="success" variant="light" size="small" class="chain-mode-tag">
+              {{ $t('page.rule.chain_mode.recommend') }}
+            </t-tag>
+          </t-radio>
+          <div class="chain-mode-desc">{{ opt.desc }}</div>
+        </div>
+      </t-radio-group>
+      <div class="ai-prompt-ops" style="margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end;">
+        <t-button theme="primary" :loading="chainModeSaving" @click="saveChainMode">{{ $t('common.save') }}</t-button>
+        <t-button variant="outline" @click="chainModeVisible = false">{{ $t('common.close') }}</t-button>
+      </div>
+    </t-dialog>
+  </div>
+</template>
+<script lang="ts">
+import Vue from 'vue';
+import { SearchIcon, SwapIcon } from 'tdesign-icons-vue';
+import Trend from '@/components/trend/index.vue';
+import { prefix } from '@/config/global';
+import { wafRuleListApi,wafRuleDelApi,wafRuleBatchDelApi,wafRuleDelAllApi,changeRuleStatus } from '@/apis/rules';
+import { get_detail_by_item_api, edit_system_config_by_item_api } from '@/apis/systemconfig';
+import { allhost } from '@/apis/host';
+import { RULE_STATUS,CONTRACT_STATUS, CONTRACT_STATUS_OPTIONS, CONTRACT_TYPES, CONTRACT_PAYMENT_TYPES } from '@/constants';
+
+const INITIAL_DATA = {
+  host: 'baidu.com',
+  port: 80,
+  remote_host: 'baidu2.com',
+  remote_port: 80,
+  ssl:'0',
+  remote_system:"宝塔",
+  remote_app:"API业务系统",
+  guard_status: '',
+  remarks: '',
+};
+export default Vue.extend({
+  name: 'ListBase',
+  components: {
+    SearchIcon,
+    SwapIcon,
+    Trend,
+  },
+  data() {
+    return {
+      addFormVisible:false,
+      editFormVisible:false,
+      batchDeleteVisible: false,
+      clearAllVisible: false,
+      // 规则编排模式(rule_chain_mode)：0 默认(CC之后)，1 规则优先(推荐/最新)
+      chainModeVisible: false,
+      chainModeSaving: false,
+      chainMode: '0',
+      formData: { ...INITIAL_DATA },
+      formEditData: { ...INITIAL_DATA },
+      rules: {
+        host: [{ required: true, message: this.$t('common.select_placeholder')+this.$t('page.rule.label_website'), type: 'error' }],
+      },
+      textareaValue: '',
+      RULE_STATUS,
+      prefix,
+      dataLoading: false,
+      data: [], //列表数据信息
+      detail_data:[],//加载详情信息用于编辑
+      selectedRowKeys: [],
+      value: 'first',
+      columns: [
+        { colKey: 'row-select', type: 'multiple', width: 64, fixed: 'left' },
+          {
+            title: this.$t('page.rule.label_website'),
+            align: 'left',
+            width: 200,
+            ellipsis: true,
+            colKey: 'host_code',
+          },
+        {
+          title: this.$t('page.rule.label_rule_name'),
+          align: 'left',
+          width: 200,
+          ellipsis: true,
+          colKey: 'rule_name',
+        },
+        {
+          title: this.$t('page.rule.label_rule_code'),
+          align: 'left',
+          width: 200,
+          ellipsis: true,
+          colKey: 'rule_code',
+        },
+        {
+          title: this.$t('page.rule.label_rule_salience'),
+          align: 'left',
+          width: 90,
+          colKey: 'salience',
+        },
+        { title: this.$t('page.rule.label_rule_version'), colKey: 'rule_version', width: 70, cell: { col: 'version' } },
+        { title: this.$t('page.rule.label_rule_status'), colKey: 'rule_status', width: 70, cell: { col: 'rule_status' } },
+        {
+          title: this.$t('common.update_time'),
+          width: 200,
+          ellipsis: true,
+          colKey: 'update_time',
+        },
+        {
+          title: this.$t('common.create_time'),
+          width: 200,
+          ellipsis: true,
+          colKey: 'create_time',
+        },
+        {
+          align: 'left',
+          width: 200,
+          colKey: 'op',
+          title: this.$t('common.op'),
+        },
+      ],
+      rowKey: 'rule_code',
+      tableLayout: 'auto',
+      verticalAlign: 'top',
+      hover: true,
+      rowClassName: (rowKey: string) => `${rowKey}-class`,
+      pagination: {
+        total: 0,
+        current: 1,
+        pageSize:10
+      },
+      //顶部搜索
+      searchformData: {
+        rule_name:"",
+        host_code:"",
+        rule_code:""
+      },
+      confirmVisible: false,
+      deleteIdx: -1,
+      //主机字典
+      host_dic:{}
+    };
+  },
+  computed: {
+    confirmBody() {
+      if (this.deleteIdx > -1) {
+        const { host } = this.data?.[this.deleteIdx];
+        return this.$t('common.data_delete_warning');
+      }
+      return '';
+    },
+    offsetTop() {
+      return this.$store.state.setting.isUseTabsRouter ? 48 : 0;
+    },
+    chainModeOptions() {
+      return [
+        {
+          value: '0',
+          label: this.$t('page.rule.chain_mode.mode0_label'),
+          desc: this.$t('page.rule.chain_mode.mode0_desc'),
+          recommend: false,
+        },
+        {
+          value: '1',
+          label: this.$t('page.rule.chain_mode.mode1_label'),
+          desc: this.$t('page.rule.chain_mode.mode1_desc'),
+          recommend: true,
+        },
+      ];
+    },
+  },
+  mounted() {
+    this.loadHostList().then(() => {
+      this.getList("");
+    });
+  },
+
+  methods: {
+    // 打开"规则编排模式"设置并读取当前值
+    openChainMode() {
+      this.chainModeVisible = true;
+      get_detail_by_item_api({ item: 'rule_chain_mode' })
+        .then((res) => {
+          if (res.code === 0 && res.data) {
+            this.chainMode = res.data.value === '1' ? '1' : '0';
+          }
+        })
+        .catch((e) => { console.log(e); });
+    },
+    // 保存"规则编排模式"（走系统配置 editByItem，后端会热同步到 global）
+    saveChainMode() {
+      this.chainModeSaving = true;
+      edit_system_config_by_item_api({ item: 'rule_chain_mode', value: this.chainMode })
+        .then((res) => {
+          if (res.code === 0) {
+            this.$message.success(this.$t('page.rule.chain_mode.saved'));
+            this.chainModeVisible = false;
+          } else {
+            this.$message.warning(res.msg || this.$t('page.rule.chain_mode.save_fail'));
+          }
+        })
+        .catch((e) => {
+          console.log(e);
+          this.$message.error(this.$t('page.rule.chain_mode.save_fail'));
+        })
+        .finally(() => { this.chainModeSaving = false; });
+    },
+    loadHostList() {
+      return new Promise((resolve, reject) => {
+        allhost()
+          .then((res) => {
+            let resdata = res;
+            console.log(resdata);
+            if (resdata.code === 0) {
+              let host_options = resdata.data;
+              for (let i = 0; i < host_options.length; i++) {
+                this.host_dic[host_options[i].value] = host_options[i].label;
+              }
+            }
+            resolve(); // 调用 resolve 表示加载完成
+          })
+          .catch((e: Error) => {
+            console.log(e);
+            reject(e); // 调用 reject 表示加载失败
+          });
+      });
+    },
+    getList(keyword){
+      let that = this
+      wafRuleListApi(
+              {
+                 pageSize: that.pagination.pageSize,
+                 pageIndex: that.pagination.current,
+                ...that.searchformData
+             }
+        )
+        .then((res) => {
+          let resdata = res
+          console.log(resdata)
+          if (resdata.code === 0) {
+            this.data = resdata.data.list??[];
+            this.pagination = {
+              ...this.pagination,
+              total: resdata.data.total,
+            };
+          }
+        })
+        .catch((e: Error) => {
+          console.log(e);
+        })
+        .finally(() => {
+          this.dataLoading = false;
+        });
+      this.dataLoading = true;
+    },
+    getContainer() {
+      return document.querySelector('.tdesign-starter-layout');
+    },
+    rehandlePageChange(curr, pageInfo) {
+      this.pagination.current = curr.current
+      if(this.pagination.pageSize != curr.pageSize){
+          this.pagination.current = 1
+          this.pagination.pageSize = curr.pageSize
+      }
+      this.getList("")
+    },
+    rehandleSelectChange(selectedRowKeys: number[]) {
+      this.selectedRowKeys = selectedRowKeys;
+    },
+    rehandleChange(changeParams, triggerAndData) {
+    },
+
+    handleClickEdit(e) {
+      console.log(e)
+      const { rule_code } = e.row
+      console.log(rule_code)
+      this.$router.push(
+              {
+                path:'/waf-host/wafruleedit',
+                query: {
+                  type: "edit",
+                  code: rule_code
+                },
+              },
+       );
+    },
+    handleAddRule() {
+      this.$router.push(
+              {
+                path:'/waf-host/wafruleedit',
+                query: {
+                  type: "add",
+                },
+              },
+       );
+    },
+    onClickCloseBtn(): void {
+      this.formVisible = false;
+      this.formData = {};
+    },
+    onClickCloseEditBtn(): void {
+      this.editFormVisible = false;
+      this.formEditData = {};
+    },
+    handleClickDelete(row) {
+      console.log(row)
+      this.deleteIdx = row.rowIndex;
+      this.confirmVisible = true;
+    },
+    onConfirmDelete() {
+      this.confirmVisible = false;
+      let {rule_code} =  this.data[this.deleteIdx]
+      let that = this
+      wafRuleDelApi({ CODE: rule_code })
+        .then((res) => {
+          let resdata = res
+          console.log(resdata)
+          if (resdata.code === 0) {
+
+            that.pagination.current = 1
+            that.getList("")
+            that.$message.success(resdata.msg);
+          }else{
+            that.$message.warning(resdata.msg);
+          }
+        })
+        .catch((e: Error) => {
+          console.log(e);
+        })
+        .finally(() => {});
+
+
+      this.resetIdx();
+    },
+    onCancel() {
+      this.resetIdx();
+    },
+    resetIdx() {
+      this.deleteIdx = -1;
+    },
+    // 批量删除处理
+    handleBatchDelete() {
+      if (this.selectedRowKeys.length === 0) {
+        this.$message.warning(this.$t('page.rule.no_data_selected'));
+        return;
+      }
+      this.batchDeleteVisible = true;
+    },
+
+    // 清空所有处理
+    handleClearAll() { 
+      this.clearAllVisible = true;
+    },
+
+    // 确认批量删除
+    onConfirmBatchDelete() {
+      this.batchDeleteVisible = false;
+      const that = this;
+      const codes = this.selectedRowKeys.map(key => {
+        const item = this.data.find(d => d.rule_code === key);
+        return item ? item.rule_code : null;
+      }).filter(rule_code => rule_code !== null);
+      
+      wafRuleBatchDelApi({ codes: codes })
+        .then((res) => {
+          const resdata = res;
+          console.log(resdata);
+          if (resdata.code === 0) {
+            that.getList("");
+            that.selectedRowKeys = [];
+            that.$message.success(that.$t('page.rule.batch_delete_success'));
+          } else {
+            that.$message.warning(resdata.msg);
+          }
+        })
+        .catch((e: Error) => {
+          console.log(e);
+          that.$message.error('批量删除失败');
+        })
+        .finally(() => {});
+    },
+    
+    // 确认清空所有
+    onConfirmClearAll() {
+      this.clearAllVisible = false;
+      const that = this;
+      
+      wafRuleDelAllApi({ host_code: this.searchformData.host_code })
+        .then((res) => {
+          const resdata = res;
+          console.log(resdata);
+          if (resdata.code === 0) {
+            that.getList("");
+            that.selectedRowKeys = [];
+            that.$message.success(that.$t('page.rule.clear_all_success'));
+          } else {
+            that.$message.warning(resdata.msg);
+          }
+        })
+        .catch((e: Error) => {
+          console.log(e);
+          that.$message.error('清空失败');
+        })
+        .finally(() => {});
+    },
+    
+    // 取消批量删除
+    onCancelBatchDelete() {
+      this.batchDeleteVisible = false;
+    },
+    
+    // 取消清空所有
+    onCancelClearAll() {
+      this.clearAllVisible = false;
+    },
+    //跳转界面
+    // 修改规则状态
+    changeRuleStatus(value, row) {
+      // value 当前状态 true/1 启动, false/0 关闭，点击时应该切换为相反的状态
+      const that = this;
+      const currentStatus = row.rule_status === 1 ? 1 : 0;
+      const newStatus = currentStatus === 1 ? 0 : 1; // 切换为相反的状态
+
+      let postData = {
+        CODE: row.rule_code,
+        rule_status: newStatus
+      }
+      console.log("rule PostData",postData);
+      changeRuleStatus(postData)
+        .then((res) => {
+          const resdata = res;
+          console.log(resdata);
+          if (resdata.code === 0) {
+            row.rule_status = newStatus;
+            that.$message.success(resdata.msg);
+          } else {
+            // 如果失败，则恢复原来状态
+            row.rule_status = currentStatus;
+            that.$message.warning(resdata.msg);
+          }
+        })
+        .catch((e: Error) => {
+          console.log(e);
+          // 操作失败，恢复原来状态
+          row.rule_status = currentStatus;
+          that.$message.error(that.$t('common.operation_failed'));
+        });
+    },
+  },
+});
+</script>
+
+<style lang="less" scoped>
+@import '@/style/variables';
+
+
+/* 操作区：增删操作(左) + 编排模式(右) 一行分列 */
+.rule-toolbar-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+/* 筛选区：单独一行，与操作区用分隔线区隔 */
+.rule-toolbar-search {
+  padding-top: 12px;
+  border-top: 1px solid var(--td-component-stroke, #e7e7e7);
+  margin-bottom: 8px;
+
+  .t-form {
+    margin-bottom: 0;
+  }
+
+  .t-form__item {
+    margin-bottom: 8px;
+  }
+}
+
+/* 编排模式：图标 + 强调描边，突出这是个配置入口 */
+.chain-mode-btn {
+  .t-icon {
+    margin-right: 4px;
+  }
+}
+
+.left-operation-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+
+  .selected-count {
+    display: inline-block;
+    margin-left: 8px;
+    color: var(--td-text-color-secondary);
+  }
+}
+
+.search-input {
+  width: 220px;
+}
+
+.t-button + .t-button {
+    margin-left: @spacer;
+ }
+
+/* 操作区用 flex gap 控制间距，避免与上面的相邻按钮 margin 叠加 */
+.rule-toolbar-actions .t-button + .t-button,
+.left-operation-container .t-button + .t-button {
+  margin-left: 0;
+}
+
+.chain-mode-group {
+  display: block;
+  width: 100%;
+}
+.chain-mode-item {
+  border: 1px solid var(--td-component-border, #e7e7e7);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  cursor: pointer;
+}
+.chain-mode-item:hover {
+  border-color: var(--td-brand-color, #0052d9);
+}
+.chain-mode-label {
+  font-weight: 500;
+}
+.chain-mode-tag {
+  margin-left: 8px;
+}
+.chain-mode-desc {
+  color: var(--td-text-color-secondary, #666);
+  font-size: 12px;
+  margin-top: 6px;
+  padding-left: 24px;
+  line-height: 1.6;
+}
+</style>

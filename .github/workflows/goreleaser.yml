@@ -1,0 +1,326 @@
+name: goreleaser
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+env:
+  REGISTRY: docker.io
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+jobs:
+  # Linux 和 Windows 编译任务
+  goreleaser-linux-windows:
+    runs-on: ubuntu-latest
+    # 卡死保护：apt/网络挂住时快速失败，而不是烧满 6 小时默认上限
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # 与 Win7 专用版同一版本，且不低于 go.mod 里的 toolchain，避免构建时再下载一次工具链
+          go-version: '1.25.11'
+          check-latest: false
+          # 关掉 Go 缓存：tag 触发的 run 拿不到别的 ref 存下的缓存，每次必然未命中，
+          # 结果是"只写不读"——白花 30~140s 打包上传，还把仓库 10GB 缓存额度顶满导致互相驱逐。
+          # 等哪天在 main 上加了缓存预热 job（默认分支的缓存所有 ref 都能读），再把这里改回 true。
+          cache: false
+      
+      # 说明：tar/gzip/wget/curl 是 ubuntu-latest 镜像自带的，原来的 "Install basic tools"
+      # 步骤只是白跑一次 apt，却是 2026-08-19 卡住 72 分钟的那一步，已删除。
+      - name: Install dependencies for cross-compilation
+        timeout-minutes: 15
+        run: bash .github/scripts/apt-install.sh gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu build-essential musl-tools
+      
+      - name: Run GoReleaser (Linux/Windows only)
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          distribution: goreleaser
+          version: '2.1.0'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CGO_ENABLED: 1
+          # 设置环境变量跳过macOS编译
+          SKIP_MACOS: "true"
+      - name: List Folder
+        run: |
+          ls
+          cd dist
+          ls
+      - name: Get current tag
+        run: echo "IMAGE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Check if the tag contains "beta"
+        id: check_beta
+        run: |
+          echo "Is the tag beta? ${GITHUB_REF}" 
+          if [[ "${GITHUB_REF}" == *"beta"* ]]; then
+            echo "is_beta=true" >> $GITHUB_ENV
+          else
+            echo "is_beta=false" >> $GITHUB_ENV
+          fi
+      # Login to Docker Hub
+      - name: Login to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_HUB_USER }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+      # Check if should build Docker (only for 'all' tags or non-platform-specific tags)
+      - name: Check if should build Docker
+        id: check_docker
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Checking tag: $TAG_NAME"
+          
+          # Check if tag contains platform-specific keywords (but not 'all')
+          if echo "$TAG_NAME" | grep -qE "(linux|windows|win|macos|darwin|debug|arm64)" && ! echo "$TAG_NAME" | grep -q "all"; then
+            echo "Platform-specific tag detected, skipping Docker build"
+            echo "skip_docker=true" >> $GITHUB_OUTPUT
+          else
+            echo "Building Docker for all platforms or 'all' tag"
+            echo "skip_docker=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Set up Docker Buildx
+      - name: Set up Docker Buildx
+        if: steps.check_docker.outputs.skip_docker != 'true'
+        uses: docker/setup-buildx-action@v2
+      # Build and Push Docker Image for Multi-Arch
+      - name: Build and Push Docker Image for Multi-Arch
+        if: steps.check_docker.outputs.skip_docker != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64  # Support for both architectures
+          push: true  # Push to Docker Hub
+          tags: |
+            samwaf/samwaf:${{ env.IMAGE_TAG }}
+            samwaf/samwaf:beta
+            ${{ env.is_beta == 'false' && 'samwaf/samwaf:latest' || '' }}
+      # Test the Docker Image  (latest)
+      - name: Test Docker Image (latest)
+        if: steps.check_docker.outputs.skip_docker != 'true'
+        run: |
+          echo "Testing Docker image with 'latest' tag..."
+          docker run -d --name=samwaf-latest-instance \
+            -p 26666:26666 \
+            samwaf/samwaf:latest
+
+          # 等待服务启动
+          sleep 5
+
+          # 测试服务是否正常运行
+          curl -f http://localhost:26666 || (echo "Test for 'latest' tag failed" && exit 1)
+
+          # 停止并移除容器
+          docker stop samwaf-latest-instance
+          docker rm samwaf-latest-instance
+      - name: Test Docker Image (current tag)
+        if: steps.check_docker.outputs.skip_docker != 'true'
+        run: |
+          echo "Testing Docker image with tag '${{ env.IMAGE_TAG }}'..."
+          docker run -d --name=samwaf-current-instance \
+            -p 26666:26666 \
+            samwaf/samwaf:${{ env.IMAGE_TAG }}
+          
+          # 等待服务启动
+          sleep 5
+          
+          # 测试服务是否正常运行
+          curl -f http://localhost:26666 || (echo "Test for current tag '${{ env.IMAGE_TAG }}' failed" && exit 1)
+          
+          # 停止并移除容器
+          docker stop samwaf-current-instance
+          docker rm samwaf-current-instance
+
+  # macOS 编译任务 (使用原生 macOS runner )
+  goreleaser-macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # 与 Win7 专用版同一版本，且不低于 go.mod 里的 toolchain，避免构建时再下载一次工具链
+          go-version: '1.25.11'
+          check-latest: false
+          # 关掉 Go 缓存：tag 触发的 run 拿不到别的 ref 存下的缓存，每次必然未命中，
+          # 结果是"只写不读"——白花 30~140s 打包上传，还把仓库 10GB 缓存额度顶满导致互相驱逐。
+          # 等哪天在 main 上加了缓存预热 job（默认分支的缓存所有 ref 都能读），再把这里改回 true。
+          cache: false
+      
+      - name: Download SamWafWeb
+        run: bash .github/scripts/fetch_web_dist.sh
+
+      - name: Check if should build macOS
+        id: check_macos
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Checking tag: $TAG_NAME"
+          
+          # 检查是否应该编译 macOS
+          if echo "$TAG_NAME" | grep -qE "(macos|darwin|all)" || ! echo "$TAG_NAME" | grep -qE "(linux|windows|win)"; then
+            echo "Building macOS binaries"
+            echo "skip_macos=false" >> $GITHUB_OUTPUT
+          else
+            echo "Skipping macOS build for platform-specific tag"
+            echo "skip_macos=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Build macOS binaries
+        if: steps.check_macos.outputs.skip_macos != 'true'
+        env:
+          CGO_ENABLED: 1
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+        run: |
+          # 获取当前标签
+          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+          BUILDTIME=$(date +'%Y%m%d')
+          
+          # 编译 AMD64 版本
+          echo "Building macOS AMD64..."
+          GOOS=darwin GOARCH=amd64 go build \
+            -ldflags="-X SamWaf/global.GWAF_RELEASE=true -X SamWaf/global.GWAF_RUNTIME_WIN7_VERSION=false -X SamWaf/global.GWAF_RELEASE_VERSION_NAME=${BUILDTIME} -X SamWaf/global.GWAF_RELEASE_VERSION=${CURRENT_TAG} -s -w" \
+            -o ./dist/SamWafDarwinAmd64 ./cmd/samwaf/main.go
+          
+          # 编译 ARM64 版本 (Apple Silicon)
+          echo "Building macOS ARM64..."
+          GOOS=darwin GOARCH=arm64 go build \
+            -ldflags="-X SamWaf/global.GWAF_RELEASE=true -X SamWaf/global.GWAF_RUNTIME_WIN7_VERSION=false -X SamWaf/global.GWAF_RELEASE_VERSION_NAME=${BUILDTIME} -X SamWaf/global.GWAF_RELEASE_VERSION=${CURRENT_TAG} -s -w" \
+            -o ./dist/SamWafDarwinArm64 ./cmd/samwaf/main.go
+          
+          # 创建压缩包
+          mkdir -p release
+          tar -czf release/SamWaf_Darwin_x86_64.${CURRENT_TAG}.tar.gz -C dist SamWafDarwinAmd64
+          tar -czf release/SamWaf_Darwin_arm64.${CURRENT_TAG}.tar.gz -C dist SamWafDarwinArm64
+      
+      - name: Archive macOS artifacts
+        if: steps.check_macos.outputs.skip_macos != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SamWaf-macOS-binaries
+          path: |
+            release/SamWaf_Darwin_x86_64*.tar.gz
+            release/SamWaf_Darwin_arm64*.tar.gz
+      
+      - name: Release macOS binaries
+        if: steps.check_macos.outputs.skip_macos != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/SamWaf_Darwin_x86_64*.tar.gz
+            release/SamWaf_Darwin_arm64*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  win7win2008r2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check if should build Win7
+        id: check_win7_build
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Checking tag: $TAG_NAME"
+          
+          # 检查是否应该跳过 Win7 编译
+          if echo "$TAG_NAME" | grep -qE "(linux|macos|darwin|debug|arm64)" && ! echo "$TAG_NAME" | grep -q "all"; then
+            echo "Platform-specific tag detected, skipping Win7 build"
+            echo "skip_win7_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Building Win7 version"
+            echo "skip_win7_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        uses: actions/setup-go@v5
+        with:
+          # 锁定小版本
+          go-version: '1.25.11'
+          check-latest: false
+          # 关掉 Go 缓存：tag 触发的 run 拿不到别的 ref 存下的缓存，每次必然未命中，
+          # 结果是"只写不读"——白花 30~140s 打包上传，还把仓库 10GB 缓存额度顶满导致互相驱逐。
+          # 等哪天在 main 上加了缓存预热 job（默认分支的缓存所有 ref 都能读），再把这里改回 true。
+          cache: false
+
+      # mingw 和 upx 合并成一次 apt（原来分两步 = 两次抢锁两次拉源，翻倍的卡死概率）
+      - name: Install dependencies for Windows cross-compilation
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        timeout-minutes: 15
+        run: bash .github/scripts/apt-install.sh gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 build-essential upx
+
+      - name: DownLoad New SamWafWeb
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        run: |
+          bash .github/scripts/fetch_web_dist.sh
+          ls
+          ls public
+          ls public/dist
+
+      - name: Revert Golang1.25 commit for Windows7/8
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        run: |
+          cd $(go env GOROOT)
+          patch --verbose -p 1 < $GITHUB_WORKSPACE/.github/win7patch/patch_go125/1bdabae205052afe1dadb2ad6f1ba612cdbc532a.diff
+          patch --verbose -p 1 < $GITHUB_WORKSPACE/.github/win7patch/patch_go125/34b899c2fb39b092db4fa67c4417e41dc046be4b.diff
+          patch --verbose -p 1 < $GITHUB_WORKSPACE/.github/win7patch/patch_go125/466f6c7a29bc098b0d4c987b803c779222894a11.diff
+          patch --verbose -p 1 < $GITHUB_WORKSPACE/.github/win7patch/patch_go125/a90777dcf692dd2168577853ba743b4338721b06.diff
+          patch --verbose -p 1 < $GITHUB_WORKSPACE/.github/win7patch/patch_go125/bed309eff415bcb3c77dd4bc3277b682b89a388d.diff
+          patch --verbose -p 1 < $GITHUB_WORKSPACE/.github/win7patch/patch_go125/f6bddda4e8ff58a957462a1a09562924d5f3d05c.diff
+
+      - name: Get current tag
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        id: get_tag
+        run: echo "CURRENT_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Set BUILDTIME environment variable
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        run: echo "BUILDTIME=$(date +'%Y%m%d')" >> $GITHUB_ENV
+
+      - name: Build Win7/Win8/Windows2008r2
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 1
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+          CGO_CFLAGS: -Wno-unused-variable -Wno-implicit-function-declaration
+          BUILDTIME: ${{ env.BUILDTIME }}
+          CURRENT_TAG: ${{ env.CURRENT_TAG }}
+        run: |
+          go build -ldflags="-X SamWaf/global.GWAF_RUNTIME_WIN7_VERSION=true -X SamWaf/global.GWAF_RELEASE=true -X SamWaf/global.GWAF_RELEASE_VERSION_NAME=${BUILDTIME} -X SamWaf/global.GWAF_RELEASE_VERSION=${CURRENT_TAG} -s -w -extldflags '-static'" -o ./release/SamWaf64ForWin7Win8Win2008.exe ./cmd/samwaf/main.go
+
+      - name: Archive artifacts
+        if: steps.check_win7_build.outputs.skip_win7_build != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SamWaf64ForWin7Win8Win2008
+          path: release/SamWaf64ForWin7Win8Win2008.exe
+      
+      - name: Release 
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release/SamWaf64ForWin7Win8Win2008.exe

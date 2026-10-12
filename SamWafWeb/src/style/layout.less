@@ -1,0 +1,296 @@
+@import './variables.less';
+@import './font-family.less';
+
+// layout rewrite
+
+.t-layout__sider {
+  width: fit-content;
+}
+
+.t-layout.t-layout--with-sider {
+  > .t-layout {
+    flex: 1;
+    min-width: 760px;
+  }
+}
+
+.t-layout.t-layout--with-sider {
+  > .t-layout__content {
+    flex: 1;
+    min-width: 760px;
+  }
+}
+
+.t-menu--dark .t-menu__operations .t-icon {
+  color: rgba(255, 255, 255, 0.55);
+  &:hover {
+    cursor: pointer;
+  }
+}
+.t-default-menu.t-menu--dark {
+  background: var(--td-gray-color-13);
+}
+.t-default-menu .t-menu__item.t-is-active:not(.t-is-opened) {
+  background-color: var(--td-brand-color-1);
+  color: var(--td-brand-color);
+  position: relative;
+  .t-icon {
+    color: var(--td-brand-color);
+  }
+}
+
+.t-alert--info {
+  background-color: var(--td-brand-color-1);
+}
+
+.@{starter-prefix} {
+  // 布局元素调整
+  &-wrapper {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  &-main-wrapper {
+    height: 500px;
+    overflow: scroll;
+  }
+
+  &-side-nav-layout {
+    &-relative {
+      height: 100%;
+    }
+  }
+
+  &-content-layout {
+    padding: @spacer-3;
+  }
+
+  &-layout {
+    height: calc(100vh - 64px);
+    overflow-y: scroll;
+
+    &-tabs-nav {
+      max-width: 100%;
+      position: fixed;
+      overflow: visible;
+      z-index: 100;
+    }
+    &-tabs-nav + .@{starter-prefix}-content-layout {
+      padding-top: @spacer-3;
+    }
+
+    &::-webkit-scrollbar {
+      width: 8px;
+      background: transparent;
+    }
+
+    &::-webkit-scrollbar-thumb {
+      border-radius: 6px;
+      border: 2px solid transparent;
+      background-clip: content-box;
+      background-color: var(--td-scrollbar-color);
+    }
+  }
+
+  &-footer-layout {
+    padding: 0;
+    margin-bottom: @spacer-2;
+  }
+
+  // slideBar
+  &-sidebar-layout {
+    height: 100%;
+  }
+
+  &-sidebar-compact {
+    width: 64px;
+  }
+
+  &-sidebar-layout-side {
+    z-index: 100;
+  }
+
+  &-side-nav {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: 200;
+    transition: all 0.3s;
+    min-height: 100%;
+
+    &-mix {
+      top: 64px;
+
+      &-fixed {
+        top: 64px;
+        z-index: 0;
+      }
+    }
+
+    &-no-fixed {
+      position: relative;
+      z-index: 1;
+    }
+
+    &-no-logo {
+      z-index: 1;
+    }
+
+    &-logo-wrapper {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      &:hover {
+        cursor: pointer;
+      }
+    }
+
+    &-logo-t-logo {
+      height: 32px;
+      width: 100%;
+    }
+
+    &-logo-tdesign-logo {
+      padding: 0 24px;
+      height: 32px;
+      width: 100%;
+      color: var(--td-text-color-primary);
+    }
+
+    &-logo-normal {
+      color: var(--td-brand-color);
+      font-size: @font-size-l;
+      transition: all 0.3s;
+    }
+  }
+
+  &-side-nav-placeholder {
+    flex: 1 1 232px;
+    min-width: 232px;
+    transition: all 0.3s;
+
+    &-hidden {
+      flex: 1 1 72px;
+      min-width: 72px;
+      transition: all 0.3s;
+    }
+  }
+}
+
+.route-tabs-dropdown {
+  .t-icon {
+    margin-right: 8px;
+  }
+}
+
+.logo-container {
+  cursor: pointer;
+  display: inline-flex;
+  height: 64px;
+  margin-left: 24px;
+}
+
+/* 左下角版本号 = 系统信息入口，需要看起来可点 */
+.version-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border-radius: var(--td-radius-default);
+  color: var(--td-brand-color);
+  font-size: 12px;
+  line-height: 20px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.version-entry:hover {
+  background-color: var(--td-brand-color-light);
+}
+
+.version-entry-icon {
+  flex: 0 0 auto;
+  font-size: 16px;
+}
+
+.version-entry-text {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* =====================================================
+ * 企业级外框架（顶栏 / 侧栏）
+ * ===================================================== */
+
+/* ---------- 顶栏 ---------- */
+.@{starter-prefix}-header-layout {
+  .t-head-menu__inner {
+    border-bottom: 1px solid var(--td-component-stroke);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+  }
+}
+
+/* ---------- 侧栏菜单 ---------- */
+.t-default-menu {
+  border-right: 1px solid var(--td-component-stroke);
+
+  &::-webkit-scrollbar {
+    width: 6px;
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 3px;
+    background: var(--td-scrollbar-color);
+  }
+
+  // Logo 区：与顶栏同高 + 底部细分隔线
+  .t-menu__logo {
+    height: 64px;
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid var(--td-component-stroke);
+  }
+
+  // 分组标题
+  .t-menu-group__title {
+    padding: 14px 16px 6px;
+    font-size: 12px;
+    line-height: 18px;
+    color: var(--td-text-color-placeholder);
+    letter-spacing: 0.4px;
+  }
+
+  // 展开态菜单项：圆角 + 呼吸间距 + 精致 hover
+  &:not(.t-is-collapsed) .t-menu__item {
+    margin: 2px 8px;
+    border-radius: 8px;
+    transition: background-color 0.2s ease, color 0.2s ease;
+
+    .t-icon {
+      transition: color 0.2s ease;
+    }
+
+    &:not(.t-is-active):not(.t-is-opened):hover {
+      background-color: var(--td-bg-color-component-hover);
+    }
+  }
+
+  // 折叠态：图标项也带圆角与 hover
+  &.t-is-collapsed .t-menu__item {
+    border-radius: 8px;
+
+    &:not(.t-is-active):hover {
+      background-color: var(--td-bg-color-component-hover);
+    }
+  }
+
+  // 暗色菜单 hover
+  &.t-menu--dark .t-menu__item:not(.t-is-active):not(.t-is-opened):hover {
+    background-color: var(--td-gray-color-12);
+  }
+}

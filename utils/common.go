@@ -1,0 +1,647 @@
+package utils
+
+import (
+	"SamWaf/common/zlog"
+	"SamWaf/global"
+	"SamWaf/model"
+	"SamWaf/wafenginecore/ipset"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// isPublicIP 判断 IP 是否为可安全对外访问的公网地址（用于防 SSRF）。
+// 拒绝：环回、私网(RFC1918 / RFC4193 fc00::/7)、链路本地(含云元数据 169.254.169.254)、
+// 未指定(0.0.0.0 / ::)、多播、CGNAT(100.64.0.0/10)、其余保留段，
+// 以及三种「把 IPv4 内网地址包在 IPv6 里」的写法：v4 兼容 ::a.b.c.d、NAT64 64:ff9b::/96、6to4 2002::/16。
+// v4 映射 ::ffff:a.b.c.d 由 Go 的 To4() 自动还原，走下面的 v4 判定。
+func isPublicIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+	// 先把内嵌的 IPv4 还原出来再判：不然 http://[64:ff9b::7f00:1]/ 这种在 NAT64 网络里
+	// 直达 127.0.0.1，却因为「它是个 IPv6 地址」被当成公网放行。
+	if embedded := embeddedIPv4(ip); embedded != nil {
+		return isPublicIPv4(embedded)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return isPublicIPv4(v4)
+	}
+	return true
+}
+
+// embeddedIPv4 取出 IPv6 地址里内嵌的 IPv4（v4 兼容 ::a.b.c.d / NAT64 64:ff9b::/96 / 6to4 2002::/16），
+// 不是这三种写法时返回 nil。
+func embeddedIPv4(ip net.IP) net.IP {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return nil
+	}
+	// 6to4 2002:V4ADDR::/16
+	if v6[0] == 0x20 && v6[1] == 0x02 {
+		return net.IPv4(v6[2], v6[3], v6[4], v6[5]).To4()
+	}
+	// NAT64 64:ff9b::/96
+	if v6[0] == 0x00 && v6[1] == 0x64 && v6[2] == 0xff && v6[3] == 0x9b {
+		allZero := true
+		for i := 4; i < 12; i++ {
+			if v6[i] != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			return net.IPv4(v6[12], v6[13], v6[14], v6[15]).To4()
+		}
+	}
+	// IPv4 兼容地址 ::a.b.c.d（前 96 位全 0，且不是 :: 与 ::1，那两个已被上面拦掉）
+	for i := 0; i < 12; i++ {
+		if v6[i] != 0 {
+			return nil
+		}
+	}
+	return net.IPv4(v6[12], v6[13], v6[14], v6[15]).To4()
+}
+
+// isPublicIPv4 IPv4 保留段判定。除内网/环回外，这些段也一律不是合法的对外访问目标。
+func isPublicIPv4(v4 net.IP) bool {
+	v4 = v4.To4()
+	if v4 == nil {
+		return false
+	}
+	if v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() ||
+		v4.IsUnspecified() || v4.IsMulticast() {
+		return false
+	}
+	switch {
+	case v4[0] == 0: // 0.0.0.0/8 "本网络"
+		return false
+	case v4[0] == 169 && v4[1] == 254: // 云元数据显式兜底（链路本地已覆盖，这里再拦一次）
+		return false
+	case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127: // CGNAT 100.64.0.0/10
+		return false
+	case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // 192.0.0.0/24 IETF 协议分配
+		return false
+	case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // 198.18.0.0/15 基准测试
+		return false
+	case v4[0] >= 240: // 240.0.0.0/4 保留 + 255.255.255.255 广播
+		return false
+	}
+	return true
+}
+
+// IsSafeOutboundHost 校验对外访问的主机(域名或IP)是否安全：解析出的所有 IP 必须为公网。
+// 域名经 net.LookupIP 解析后逐个判定，阻断"域名解析到内网/元数据"。返回 (是否安全, 原因)。
+// 注意：这是"解析时"校验，无法完全防御 DNS 重绑定/30x 跳转到内网(需连接期再校验)，属已知残留。
+func IsSafeOutboundHost(host string) (bool, string) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false, "目标主机为空"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if !isPublicIP(ip) {
+			return false, fmt.Sprintf("目标IP %s 属于内网/环回/保留地址，已拒绝", host)
+		}
+		return true, ""
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false, fmt.Sprintf("主机名 %s 解析失败: %v", host, err)
+	}
+	if len(ips) == 0 {
+		return false, fmt.Sprintf("主机名 %s 无解析结果", host)
+	}
+	for _, ip := range ips {
+		if !isPublicIP(ip) {
+			return false, fmt.Sprintf("主机名 %s 解析到内网/保留地址 %s，已拒绝", host, ip.String())
+		}
+	}
+	return true, ""
+}
+
+// IsSafeOutboundURL 校验对外请求 URL 是否安全（防 SSRF）：仅允许 http/https，
+// 且主机(域名解析后的所有IP)必须为公网。只用于程序自身的固定对外地址（升级检测）；
+// 用户可配的对外地址一律走 IsAllowedOutboundURL（带 config.yml 允许清单逃生门）。
+func IsSafeOutboundURL(rawURL string) (bool, string) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false, "URL 解析失败"
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false, "仅允许 http/https 协议"
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false, "URL 缺少主机"
+	}
+	return IsSafeOutboundHost(host)
+}
+
+// SafeHTTPClient 返回带 SSRF 防护的 http.Client：每次 30x 跳转都重新校验目标主机，
+// 拒绝跳转到内网/环回/链路本地(云元数据)/保留地址，堵住"公网URL跳转到内网"的绕过。
+// 初始 URL 的主机需由调用方先行 IsSafeOutboundURL 校验；本客户端负责后续整条跳转链。
+func SafeHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("重定向次数过多")
+			}
+			if ok, reason := IsSafeOutboundHost(req.URL.Hostname()); !ok {
+				return fmt.Errorf("重定向目标不被允许: %s", reason)
+			}
+			return nil
+		},
+	}
+}
+
+func GetExternalIp() string {
+	// 创建带超时的HTTP客户端,避免DNS解析问题
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 5 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
+	resp, err := client.Get("http://myexternalip.com/raw")
+	if err != nil {
+		zlog.Debug("GetExternalIp failed: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		zlog.Debug("ReadAll failed: %v", err)
+		return ""
+	}
+
+	clientIP := strings.TrimSpace(string(body))
+	return clientIP
+}
+
+func GetCurrentDir() string {
+	// 检测环境变量是否存在
+	envVar := "SamWafIDE"
+	if _, exists := os.LookupEnv(envVar); exists {
+		return "."
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		fmt.Println(fmt.Sprintf("Failed to get executable path:%v", err))
+		return ""
+	}
+	exeDir := filepath.Dir(exePath)
+	return exeDir
+}
+
+// CheckDebugEnvInfo 检测是否打印debug信息
+func CheckDebugEnvInfo() bool {
+	// 检测环境变量是否存在
+	envVar := "SamWafIDEDebugLog"
+	if _, exists := os.LookupEnv(envVar); exists {
+		return true
+	}
+
+	return false
+}
+
+// Deprecated: 监听协议判定统一走 ResolveHostListens / HostMainProtocol（utils/hostport.go），
+// 本函数仅保留给 legacy 派生内部复用，新代码不得调用。
+func GetServerByHosts(hosts model.Hosts) string {
+	if hosts.Ssl == 1 {
+		return "https"
+	} else {
+		return "http"
+	}
+}
+
+/*
+*
+
+	计算两个自然天数的间隔数
+*/
+func DiffNatureDays(t1, t2 int64) int {
+	var SecondsOfDay int64 = 86400
+	if t1 == t2 {
+		return -1
+	}
+	if t1 > t2 {
+		t1, t2 = t2, t1
+	}
+
+	diffDays := 0
+	secDiff := t2 - t1
+	if secDiff > SecondsOfDay {
+		tmpDays := int(secDiff / SecondsOfDay)
+		t1 += int64(tmpDays) * SecondsOfDay
+		diffDays += tmpDays
+	}
+
+	st := time.Unix(t1, 0)
+	et := time.Unix(t2, 0)
+	dateFormatTpl := "20060102"
+	if st.Format(dateFormatTpl) != et.Format(dateFormatTpl) {
+		diffDays += 1
+	}
+
+	return diffDays
+}
+
+/**字符串->时间对象*/
+func Str2Time(formatTimeStr string) time.Time {
+	timeLayout := "20060102"
+	loc, _ := time.LoadLocation("Local")
+	theTime, _ := time.ParseInLocation(timeLayout, formatTimeStr, loc) //使用模板在对应时区转化为time.time类型
+
+	return theTime
+}
+
+/*
+*
+时间转int天
+*/
+func TimeToDayInt(t time.Time) int {
+	day, _ := strconv.Atoi(t.Format("20060102"))
+	return day
+}
+func GetPublicIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "localhost"
+		// log.Fatal(err)
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().String()
+	idx := strings.LastIndex(localAddr, ":")
+	return localAddr[0:idx]
+}
+
+func GetCountry(ip string) []string {
+	region, _ := GetCountryEx(ip)
+	return region
+}
+
+// GetCountryEx 与 GetCountry 相同，但额外返回本次地区是否可判定。
+//
+// 第二个返回值为 false 表示"这次查不出来"（没有可用的地区库，或查询报错），
+// 而不是"查出来是未知"。两者必须区分：IPv6 地区库缺失时若只返回"未知"，
+// `MF.COUNTRY != "中国"` 这类规则会把 IPv6 访客整片误杀，所以调用方需要据此放行。
+func GetCountryEx(ip string) ([]string, bool) {
+	if global.GIPLOCATION_MANAGER != nil {
+		result := global.GIPLOCATION_MANAGER.Lookup(ip)
+		return result.ToSlice(), !result.Unresolved // [国家, 区域, 省份, 城市, ISP]
+	}
+	return []string{"未知", "", "", "", ""}, false
+}
+
+// FormatIPLocation 把 IP 解析成一行可读的归属地文本（国家 省份 城市 运营商）
+//
+// GetCountry 返回 [国家, 区域, 省份, 城市, ISP]，这里丢掉"区域"（华东/华南这类太粗，
+// 和省份并排显示反而冗余），其余去空去重后拼成一行 —— 直接 strings.Join 会拼出
+// "中国,,,,"这种带空段的串，不能给人看。
+func FormatIPLocation(ip string) string {
+	parts := GetCountry(ip)
+	var seg []string
+	seen := map[string]bool{}
+	for i, p := range parts {
+		if i == 1 { // 跳过"区域"
+			continue
+		}
+		v := strings.TrimSpace(p)
+		if v == "" || v == "0" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		seg = append(seg, v)
+	}
+	if len(seg) == 0 {
+		return "未知"
+	}
+	return strings.Join(seg, " ")
+}
+
+// TruncateString 按字符数截断字符串（按 rune 切，避免把中文/UA 里的多字节字符切成乱码）
+func TruncateString(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+// BoolToInt 布尔转 0/1，用于落库的标志位字段
+func BoolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// CloseIPDatabase 关闭IP数据库
+func CloseIPDatabase() {
+	if global.GIPLOCATION_MANAGER != nil {
+		global.GIPLOCATION_MANAGER.Close()
+	}
+}
+
+/*
+*
+通过ip段（CIDR）来查询是否在很多CIDR段内
+*/
+func CheckIPInRanges(ip string, ipRanges []string) bool {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false // 如果IP地址解析失败，则返回false
+	}
+
+	for _, ipRange := range ipRanges {
+		_, ipNet, err := net.ParseCIDR(ipRange)
+		if err != nil {
+			return false // 如果CIDR格式解析失败，则返回false
+		}
+
+		if ipNet.Contains(parsedIP) {
+			return true // 如果IP地址在指定的CIDR范围内，则返回true
+		}
+	}
+
+	return false // 如果IP地址不在任何一个CIDR范围内，则返回false
+}
+
+/*
+*
+通过ip段（CIDR）来查询是否在这个段内
+*/
+func CheckIPInCIDR(ip string, ipRange string) bool {
+
+	parts := strings.Split(ipRange, "/")
+	if len(parts) != 2 {
+		// 如果是普通ip
+		if ip == ipRange {
+			return true
+		} else {
+			return false
+		}
+	} else {
+		//如果是网段IP
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			return false // 如果IP地址解析失败，则返回false
+		}
+		_, ipNet, err := net.ParseCIDR(ipRange)
+		if err != nil {
+			return false // 如果CIDR格式解析失败，则返回false
+		}
+		if ipNet.Contains(parsedIP) {
+			return true // 如果IP地址在指定的CIDR范围内，则返回true
+		}
+		return false // 如果IP地址不在任何一个CIDR范围内，则返回false
+	}
+}
+
+// MatchIPPattern 判断 ip 是否命中一个「IP 模式」，统一支持
+// 单 IP / CIDR 网段 / 通配符(10.10.*.*、2001:db8:*:*:*:*:*:*) / 闭区间(1.2.3.4-1.2.3.99)。
+//
+// 与 CheckIPInCIDR 的区别：CheckIPInCIDR 只认单 IP 与 CIDR，且非 CIDR 时做的是
+// 纯字符串相等比较。二者不能互换——CheckIPInCIDR 还被「可信代理 IP 列表」
+// (wafenginecore/clientip.go) 使用，那里绝不能接受通配符：
+// 一旦允许 *.*.*.*，任何人都能伪造 XFF 头冒充任意来源 IP。
+//
+// 本函数只用于「用户配置的黑/白名单、IP 组、自定义规则」这类判定场景。
+func MatchIPPattern(ip string, pattern string) bool {
+	return ipset.MatchPatternStrCached(ip, pattern)
+}
+
+// IsValidIPPattern 校验一个「IP 模式」是否合法，返回 (是否合法, 不合法时的中文原因)。
+// 语法范围同 MatchIPPattern。用于黑/白名单与 IP 组条目的写入校验。
+//
+// 注意与 IsValidIPOrNetwork 的分工：后者只认单 IP 与 CIDR，是严格模式，
+// 供系统防火墙下发、威胁情报源解析等「不能出现通配语法」的场景使用，不要混用。
+func IsValidIPPattern(input string) (bool, string) {
+	return ipset.IsValidPattern(input)
+}
+
+// IsCatchAllIPPattern 判断是否为「全通配」写法(*.*.*.* 或 8 段全 * 的 IPv6)。
+//
+// 这类写法语法合法但极易误写：填进白名单等于全站不设防，填进黑名单等于封禁所有人。
+// 写入侧应当拒绝并提示用户改写成显式的 0.0.0.0/0，让意图无歧义。
+func IsCatchAllIPPattern(input string) bool {
+	return ipset.IsCatchAllWildcard(input)
+}
+
+// IsValidIPOrNetwork 检查给定的字符串是否为有效的 IP 地址或 IP 段（CIDR）
+//
+// 严格模式：不接受通配符与区间。系统防火墙(iptables/netsh)下发、
+// 威胁情报源解析等场景必须用本函数；用户可配的黑/白名单请用 IsValidIPPattern。
+func IsValidIPOrNetwork(input string) (bool, string) {
+	// 尝试解析为 IP 地址
+	if ip := net.ParseIP(input); ip != nil {
+		return true, "valid IP address"
+	}
+
+	// 尝试解析为 IP 段（CIDR）
+	_, _, err := net.ParseCIDR(input)
+	if err == nil {
+		return true, "valid IP network (CIDR)"
+	}
+
+	return false, "not a valid IP or IP network (CIDR)"
+}
+
+// 检查 JSON 字符串是否为有效的 UTF-8 编码
+func CheckJSONValidity(jsonStr []byte) bool {
+	for i := 0; i < len(jsonStr); {
+		r, size := rune(jsonStr[i]), 1
+		switch {
+		case r >= 0xF0:
+			r, size = rune(jsonStr[i+3]), 4
+		case r >= 0xE0:
+			r, size = rune(jsonStr[i+2]), 3
+		case r >= 0xC0:
+			r, size = rune(jsonStr[i+1]), 2
+		default:
+		}
+		if r > 0xFFFF {
+			return false
+		}
+		i += size
+	}
+	return true
+}
+
+/*
+*
+删除老旧数据
+*/
+func DeleteOldFiles(dir string, duration time.Duration) error {
+	// 遍历目录下的文件
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// 如果是文件并且文件创建时间超过指定的时间
+		if !info.IsDir() {
+			// 获取文件的修改时间（可以近似认为是创建时间）
+			fileModTime := info.ModTime()
+
+			// 判断文件是否超过指定的时间（比如30分钟）
+			if time.Since(fileModTime) > duration {
+				// 删除文件
+				zlog.Info("删除陈旧文件:", path)
+				err := os.Remove(path)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// 检测是否属于ipv4
+func IsValidIPv4(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	return parsedIP != nil && parsedIP.To4() != nil
+}
+
+// 验证IPv6地址是否有效
+func IsValidIPv6(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	// 如果解析出的 IP 类型是 IPv6 且不是 IPv4 映射地址（IPv4-mapped IPv6 addresses）
+	return parsedIP != nil && strings.Contains(ip, ":") && parsedIP.To4() == nil
+}
+
+// 获取纯域名
+
+func GetPureDomain(host string) string {
+	// 检查是否包含端口号
+	if strings.Contains(host, ":") {
+		host, _, _ = net.SplitHostPort(host)
+	}
+	return host
+}
+
+// UpdateFileIsHasNewInfo 检查文件内容并更新
+func UpdateFileIsHasNewInfo(filePath, newContent string) error {
+	// 检查文件是否存在
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		// 文件不存在，写入新内容
+		if err := ioutil.WriteFile(filePath, []byte(newContent), 0644); err != nil {
+			return fmt.Errorf("failed to write file %s: %v", filePath, err)
+		}
+	} else {
+		// 文件存在，读取当前内容
+		currentContent, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to read file %s: %v", filePath, err)
+		}
+
+		// 比较内容是否一致
+		if string(currentContent) != newContent {
+			// 内容不一致，更新文件
+			if err := ioutil.WriteFile(filePath, []byte(newContent), 0644); err != nil {
+				return fmt.Errorf("failed to update file %s: %v", filePath, err)
+			}
+		}
+	}
+	return nil
+}
+
+// IsValidChallengeFile 检查challenge文件是否合法
+func IsValidChallengeFile(challengeFile string) bool {
+	// 定义一个正则表达式：允许字母、数字、连字符、下划线，且长度在 1 到 255 之间
+	// 这里假设合法的文件名不含有特殊字符和空格
+	re := regexp.MustCompile(`^[a-zA-Z0-9_-]{1,255}$`)
+
+	// 判断文件名是否符合正则表达式
+	return re.MatchString(challengeFile)
+}
+
+// CheckPathAndCreate 检测路径如果不存在则创建
+func CheckPathAndCreate(path string) error {
+	// 检测目录是否存在
+	_, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		// 目录不存在，创建目录
+		err := os.MkdirAll(path, os.ModePerm)
+		if err != nil {
+			return errors.New("创建目录失败" + err.Error())
+		}
+		return nil
+	} else if err != nil {
+		// 发生其他错误
+		return errors.New("检查目录失败" + err.Error())
+	} else {
+		return nil
+	}
+}
+
+// CheckSSLCertificateExpiry 检查指定主机的 SSL 证书到期情况
+// host: 需要检查的主机地址，格式为 "ssl.samwaf.com:443"
+func CheckSSLCertificateExpiry(host string) (time.Time, error) {
+	conn, err := tls.Dial("tcp", host, nil)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("无法连接到主机 %s: %v", host, err)
+	}
+	defer conn.Close()
+
+	// 获取 SSL 证书的到期时间
+	cert := conn.ConnectionState().PeerCertificates[0]
+	expiryDate := cert.NotAfter
+	// 返回到期时间
+	return expiryDate, nil
+}
+
+// GetSourceClientIP 获取原始IP
+func GetSourceClientIP(ipAndPort string) string {
+	ip, _, err := net.SplitHostPort(ipAndPort)
+	if err != nil {
+		return ""
+	} else {
+		return ip
+	}
+
+}
+
+// IsIP 判断输入是否为 IP 地址（IPv4 或 IPv6）
+func IsIP(input string) bool {
+	if input == "" {
+		return false
+	}
+
+	// 去除首尾空格
+	input = strings.TrimSpace(input)
+
+	// 使用 net.ParseIP 解析
+	// 如果是有效的 IP，返回非 nil
+	return net.ParseIP(input) != nil
+}
+

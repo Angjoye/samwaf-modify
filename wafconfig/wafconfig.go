@@ -1,0 +1,1049 @@
+package wafconfig
+
+import (
+	"SamWaf/common/uuid"
+	"SamWaf/global"
+	"SamWaf/utils"
+	"SamWaf/wafdb/dialect"
+	"SamWaf/wafowasp"
+	"crypto/rand"
+	"fmt"
+	"math/big"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/denisbrodbeck/machineid"
+	"github.com/spf13/viper"
+)
+
+// generateSecurityEntryPath 生成18位随机安全路径码（大小写字母+数字）
+func generateSecurityEntryPath() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const length = 18
+	result := make([]byte, length)
+	for i := range result {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			result[i] = charset[i%len(charset)]
+		} else {
+			result[i] = charset[n.Int64()]
+		}
+	}
+	return string(result)
+}
+
+// 加载配置并初始化
+func LoadAndInitConfig() {
+	// 格式化当前时间为指定格式
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+	fmt.Printf("%s\tINFO\tload config\n", currentTime)
+	/**
+	1.如果user_code存在就使用本地的user_code
+	2.
+	*/
+	// 判断备份目录是否存在，不存在则创建
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return
+		}
+	}
+	config := viper.New()
+	config.AddConfigPath(configDir) // 文件所在目录
+	config.SetConfigName("config")  // 文件名
+	config.SetConfigType("yml")     // 文件类型
+
+	// 添加一个标志，用于跟踪配置是否有变化
+	configChanged := false
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			err = config.SafeWriteConfig()
+			configChanged = true
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+		}
+	}
+	if config.IsSet("user_code") == false {
+		id, err := machineid.ID()
+		if err != nil {
+			newcode := "RAD" + uuid.GenUUID()
+			config.Set("user_code", newcode)
+			global.GWAF_USER_CODE = newcode
+		} else {
+			config.Set("user_code", id)
+			global.GWAF_USER_CODE = id
+		}
+		configChanged = true
+	} else {
+		global.GWAF_USER_CODE = config.GetString("user_code")
+	}
+	if config.IsSet("soft_id") == false {
+		config.Set("soft_id", global.GWAF_TENANT_ID)
+		configChanged = true
+	} else {
+		global.GWAF_TENANT_ID = config.GetString("soft_id")
+	}
+	if config.IsSet("local_port") {
+		global.GWAF_LOCAL_SERVER_PORT = config.GetInt("local_port") //读取本地端口
+	}
+	if config.IsSet("custom_server_name") {
+		global.GWAF_CUSTOM_SERVER_NAME = config.GetString("custom_server_name") //本地服务器其定义名称
+	} else {
+		hostname, err := os.Hostname()
+		if err != nil {
+			global.GWAF_CUSTOM_SERVER_NAME = "未定义服务器名称"
+		} else {
+			config.Set("custom_server_name", hostname)
+			global.GWAF_CUSTOM_SERVER_NAME = hostname
+		}
+		configChanged = true
+	}
+	if config.IsSet("notice.isenable") {
+		global.GWAF_NOTICE_ENABLE = config.GetBool("notice.isenable")
+	} else {
+		config.Set("notice.isenable", false)
+		configChanged = true
+	}
+	if config.IsSet("notice.title") {
+		global.GWAF_NOTICE_TITLE = config.GetString("notice.title")
+	} else {
+		global.GWAF_NOTICE_TITLE = global.GWAF_CUSTOM_SERVER_NAME
+		config.Set("notice.title", global.GWAF_CUSTOM_SERVER_NAME)
+		configChanged = true
+	}
+
+	if config.IsSet("export_download") == false {
+		config.Set("export_download", global.GWAF_CAN_EXPORT_DOWNLOAD_LOG)
+		configChanged = true
+	} else {
+		global.GWAF_CAN_EXPORT_DOWNLOAD_LOG = config.GetBool("export_download")
+	}
+
+	// 优雅升级/停止时连接排空超时（秒）。Supervisor 与 Worker 均在启动时从 config.yml 读取，
+	// 超时仍未排空的连接将被强制关闭。<=0 时回退到默认 30s。
+	if config.IsSet("drain_time_out") {
+		if v := config.GetInt64("drain_time_out"); v > 0 {
+			global.GCONFIG_RECORD_DRAIN_TIMEOUT = v
+		}
+	} else {
+		config.Set("drain_time_out", global.GCONFIG_RECORD_DRAIN_TIMEOUT)
+		configChanged = true
+	}
+
+	// 应用内升级替换二进制后，界面等待服务重新就绪的上限（秒）。由升级进度接口下发给前端。
+	// 只读 config.yml、不进数据库/API：容器或低配机器重启慢，属部署环境差异，运营方带外调整。
+	if config.IsSet("update_restart_timeout") {
+		if v := config.GetInt64("update_restart_timeout"); v > 0 {
+			global.GCONFIG_UPDATE_RESTART_TIMEOUT = v
+		}
+	} else {
+		config.Set("update_restart_timeout", global.GCONFIG_UPDATE_RESTART_TIMEOUT)
+		configChanged = true
+	}
+
+	// 版本/清单检查请求是否附带运行环境标识
+	if config.IsSet("update_env_report") {
+		global.GCONFIG_UPDATE_ENV_REPORT = config.GetBool("update_env_report")
+	} else {
+		config.Set("update_env_report", global.GCONFIG_UPDATE_ENV_REPORT)
+		configChanged = true
+	}
+
+	// 调试响应头开关：开启后在响应头加 X-SamWaf-Worker 标记处理进程，便于验证升级时新旧 Worker 交替。
+	// Supervisor 与 Worker 均在启动时从 config.yml 读取（服务模式下环境变量不会从交互式 shell 传入，故改用配置项）。
+	if config.IsSet("debug_worker_header") {
+		global.GWAF_DEBUG_WORKER_HEADER = config.GetBool("debug_worker_header")
+	} else {
+		config.Set("debug_worker_header", global.GWAF_DEBUG_WORKER_HEADER)
+		configChanged = true
+	}
+
+	// 应用管理功能开关（默认关闭）
+	if config.IsSet("application_manage") == false {
+		config.Set("application_manage", global.GWAF_CAN_APP_MANAGE)
+		configChanged = true
+	} else {
+		global.GWAF_CAN_APP_MANAGE = config.GetBool("application_manage")
+	}
+
+	// 应用允许工作目录（逗号分隔，默认 data/applications）
+	if config.IsSet("application_allow_dirs") == false {
+		config.Set("application_allow_dirs", global.GWAF_APP_ALLOW_DIRS)
+		configChanged = true
+	} else {
+		global.GWAF_APP_ALLOW_DIRS = config.GetString("application_allow_dirs")
+	}
+
+	// 应用操作密码（高危操作二次确认）：启用时若为空则自动生成并落盘
+	if config.IsSet("application_op_password") == false || config.GetString("application_op_password") == "" {
+		if global.GWAF_CAN_APP_MANAGE {
+			newOpPwd := generateSecurityEntryPath()
+			config.Set("application_op_password", newOpPwd)
+			global.GWAF_APP_OP_PASSWORD = newOpPwd
+			configChanged = true
+			fmt.Printf("%s\tINFO\t==========================================\n", currentTime)
+			fmt.Printf("%s\tINFO\t应用管理操作密码（首次自动生成）: %s\n", currentTime, newOpPwd)
+			fmt.Printf("%s\tINFO\t请妥善保管；忘记可清空 conf/config.yml 中 application_op_password 字段后重启重新生成\n", currentTime)
+			fmt.Printf("%s\tINFO\t==========================================\n", currentTime)
+		}
+	} else {
+		global.GWAF_APP_OP_PASSWORD = config.GetString("application_op_password")
+	}
+
+	if config.IsSet("zlog.outputformat") {
+		global.GWAF_LOG_OUTPUT_FORMAT = config.GetString("zlog.outputformat")
+	} else {
+		config.Set("zlog.outputformat", global.GWAF_LOG_OUTPUT_FORMAT)
+		configChanged = true
+	}
+
+	// 添加debug日志开关配置
+	if config.IsSet("zlog.debug_enable") {
+		global.GWAF_LOG_DEBUG_ENABLE = config.GetBool("zlog.debug_enable")
+	} else {
+		config.Set("zlog.debug_enable", global.GWAF_LOG_DEBUG_ENABLE)
+		configChanged = true
+	}
+	// 同步 OWASP 详情日志开关（debug 开才采集完整 collection，否则热路径零额外开销）
+	wafowasp.SetDebugEnabled(global.GWAF_LOG_DEBUG_ENABLE)
+
+	// 添加数据库日志开关配置
+	if config.IsSet("zlog.db_debug_enable") {
+		global.GWAF_LOG_DEBUG_DB_ENABLE = config.GetBool("zlog.db_debug_enable")
+	} else {
+		config.Set("zlog.db_debug_enable", global.GWAF_LOG_DEBUG_DB_ENABLE)
+		configChanged = true
+	}
+
+	//配置和提取白名单
+	if config.IsSet("security.ip_whitelist") {
+		global.GWAF_IP_WHITELIST = config.GetString("security.ip_whitelist")
+	} else {
+		config.Set("security.ip_whitelist", global.GWAF_IP_WHITELIST)
+		configChanged = true
+	}
+
+	//管理端可信代理网段（CIDR/IP，逗号分隔）。刻意放在 config.yml 而非数据库：
+	//这是“配错就可能被管理端 IP 白名单挡在门外”的救命配置，必须能不登录、改文件+重启即可修复。
+	//仅当管理请求的直连对端落在此网段内，才采信 gwaf_manage_proxy_header 指定的代理头；留空=不信任任何代理头。
+	if config.IsSet("security.manage_trusted_proxies") {
+		global.GCONFIG_MANAGE_TRUSTED_PROXIES = config.GetString("security.manage_trusted_proxies")
+	} else {
+		config.Set("security.manage_trusted_proxies", global.GCONFIG_MANAGE_TRUSTED_PROXIES)
+		configChanged = true
+	}
+
+	//管理端引用的 CDN 厂商码（管理端也挂 CDN 时）。设置后 GetManageClientIP 会额外把该厂商中心库
+	//最新回源段视为可信代理，自动跟随更新，无需手填静态网段。同放 config.yml 便于救命自救。
+	if config.IsSet("security.manage_cdn_provider") {
+		global.GCONFIG_MANAGE_CDN_PROVIDER = config.GetString("security.manage_cdn_provider")
+	} else {
+		config.Set("security.manage_cdn_provider", global.GCONFIG_MANAGE_CDN_PROVIDER)
+		configChanged = true
+	}
+
+	//SSL 证书导出允许的额外目录（绝对路径，逗号分隔）。刻意只放 config.yml、不进数据库/API：
+	//“向宿主机哪些目录落盘”属运营方的带外授权，攻击者/OpenAPI Key/普通 systemAdmin 都不能改。
+	//内置默认 data/ssl_export 恒允许；留空=只允许该默认目录（fail-closed）。
+	if config.IsSet("security.ssl_export_allowed_dirs") {
+		global.GCONFIG_SSL_EXPORT_ALLOWED_DIRS = config.GetString("security.ssl_export_allowed_dirs")
+	} else {
+		config.Set("security.ssl_export_allowed_dirs", global.GCONFIG_SSL_EXPORT_ALLOWED_DIRS)
+		configChanged = true
+	}
+
+	//每实例静态数据加密密钥(DEK)文件的自管路径。同 ssl_export_allowed_dirs 口径：
+	//只放 config.yml、不进数据库/API——密钥来源属运营方带外授权。留空=默认 data/.keys/data_key
+	//（首次启动自动生成、权限 0600）。指定自管文件便于把密钥与数据库分盘保管或统一托管。
+	if config.IsSet("security.data_key_file") {
+		global.GCONFIG_DATA_KEY_FILE = config.GetString("security.data_key_file")
+	} else {
+		config.Set("security.data_key_file", global.GCONFIG_DATA_KEY_FILE)
+		configChanged = true
+	}
+
+	//每实例传输密钥(X25519)文件的自管路径，口径同 data_key_file。
+	//留空=默认 data/.keys/comm_key（首次启动自动生成、权限 0600）。
+	if config.IsSet("security.comm_key_file") {
+		global.GCONFIG_COMM_KEY_FILE = config.GetString("security.comm_key_file")
+	} else {
+		config.Set("security.comm_key_file", global.GCONFIG_COMM_KEY_FILE)
+		configChanged = true
+	}
+
+	//是否保留 legacy 传输通道。默认 true：旧独立前端、旧移动端 App、被浏览器强缓存的旧
+	//bundle 都还在用内置密钥的 CBC 报文，关掉它们就会话不通。确认这些客户端都已升级后
+	//可手动置 false，此时没有会话密钥的请求会收到明确的重新握手信号而不是一段解不开的密文。
+	//收紧永远是运营方的主动行为——任何版本都不得自动翻转这个默认值。
+	if config.IsSet("security.comm_legacy_key") {
+		global.GCONFIG_COMM_LEGACY_KEY = config.GetBool("security.comm_legacy_key")
+	} else {
+		config.Set("security.comm_legacy_key", global.GCONFIG_COMM_LEGACY_KEY)
+		configChanged = true
+	}
+
+	//批量任务「本地路径」来源允许的额外目录（绝对路径，逗号分隔）。同 ssl_export_allowed_dirs 口径：
+	//只放 config.yml、不进数据库/API——「能读宿主机哪些目录」属运营方带外授权，
+	//攻击者/OpenAPI Key/普通管理员都不能改。内置默认 data/import 恒允许；留空=只允许该默认目录（fail-closed）。
+	if config.IsSet("security.batch_import_allowed_dirs") {
+		global.GCONFIG_BATCH_IMPORT_ALLOWED_DIRS = config.GetString("security.batch_import_allowed_dirs")
+	} else {
+		config.Set("security.batch_import_allowed_dirs", global.GCONFIG_BATCH_IMPORT_ALLOWED_DIRS)
+		configChanged = true
+	}
+
+	//用户可配的对外地址允许清单（主机名/IP/CIDR，逗号分隔）。覆盖：通知渠道 Webhook、
+	//批量任务远端来源、威胁情报订阅、CDN 回源段拉取。默认只允许公网目标；确有内网目标的部署，
+	if config.IsSet("security.outbound_allowed_hosts") {
+		global.GCONFIG_OUTBOUND_ALLOWED_HOSTS = config.GetString("security.outbound_allowed_hosts")
+	} else {
+		config.Set("security.outbound_allowed_hosts", global.GCONFIG_OUTBOUND_ALLOWED_HOSTS)
+		configChanged = true
+	}
+
+	//CORS 跨域来源白名单（逗号分隔，大小写不敏感）。同放 config.yml 而非数据库：
+	//异地部署的前端跨域配错会连不上后端，改文件即可自救；回环/本机来源(dev server)在代码里始终放行。
+	if config.IsSet("security.cors_allow_origins") {
+		global.GCONFIG_CORS_ALLOW_ORIGINS = config.GetString("security.cors_allow_origins")
+	} else {
+		config.Set("security.cors_allow_origins", global.GCONFIG_CORS_ALLOW_ORIGINS)
+		configChanged = true
+	}
+
+	//配置和提取域名白名单
+	if config.IsSet("security.domain_whitelist") {
+		global.GWAF_DOMAIN_WHITELIST = config.GetString("security.domain_whitelist")
+	} else {
+		config.Set("security.domain_whitelist", global.GWAF_DOMAIN_WHITELIST)
+		configChanged = true
+	}
+
+	//配置和提取SSL启用状态
+	if config.IsSet("security.ssl_enable") {
+		global.GWAF_SSL_ENABLE = config.GetBool("security.ssl_enable")
+	} else {
+		config.Set("security.ssl_enable", global.GWAF_SSL_ENABLE)
+		configChanged = true
+	}
+
+	//配置和提取管理端仅允许HTTPS开关
+	if config.IsSet("security.ssl_force_https") {
+		global.GWAF_SSL_FORCE_HTTPS = config.GetBool("security.ssl_force_https")
+	} else {
+		config.Set("security.ssl_force_https", global.GWAF_SSL_FORCE_HTTPS)
+		configChanged = true
+	}
+
+	//配置和提取管理端证书绑定的证书夹ID
+	if config.IsSet("security.ssl_bind_cert_id") {
+		global.GWAF_SSL_BIND_CERT_ID = config.GetString("security.ssl_bind_cert_id")
+	} else {
+		config.Set("security.ssl_bind_cert_id", global.GWAF_SSL_BIND_CERT_ID)
+		configChanged = true
+	}
+
+	//配置和提取统一访问认证的强制关闭开关（自救用）
+	//
+	//它只能从配置文件或环境变量设置，管理端故意不提供入口：这个开关的适用场景恰恰是
+	//「用户把管理端也反代进了 WAF 并开启了 Access，配错后自己都进不去管理端」——
+	//那时唯一能操作的就是配置文件。环境变量走 SAMWAF_ACCESS_DISABLE=1，容器场景更方便。
+	if config.IsSet("security.access_force_disable") {
+		global.GCONFIG_ACCESS_FORCE_DISABLE = config.GetBool("security.access_force_disable")
+	} else {
+		config.Set("security.access_force_disable", global.GCONFIG_ACCESS_FORCE_DISABLE)
+		configChanged = true
+	}
+	if v := strings.TrimSpace(os.Getenv("SAMWAF_ACCESS_DISABLE")); v == "1" || strings.EqualFold(v, "true") {
+		global.GCONFIG_ACCESS_FORCE_DISABLE = true
+	}
+
+	//配置和提取主机防爆破的强制关闭开关（自救用）
+	//
+	//同样只能从配置文件或环境变量设置。适用场景：白名单没覆盖到自己的出口IP，
+	//被 iptables/netsh 封掉后 SSH 与管理端会同时进不去，那时只剩物理控制台/云厂商VNC，
+	//能操作的只有配置文件。容器场景走 SAMWAF_HOSTGUARD_DISABLE=1 更方便。
+	//注意：它只阻止「新的」封禁，已经下发的规则仍在，需要手工 ipset del / netsh delete rule 清掉。
+	if config.IsSet("security.host_guard_force_disable") {
+		global.GCONFIG_HOST_GUARD_FORCE_DISABLE = config.GetBool("security.host_guard_force_disable")
+	} else {
+		config.Set("security.host_guard_force_disable", global.GCONFIG_HOST_GUARD_FORCE_DISABLE)
+		configChanged = true
+	}
+	if v := strings.TrimSpace(os.Getenv("SAMWAF_HOSTGUARD_DISABLE")); v == "1" || strings.EqualFold(v, "true") {
+		global.GCONFIG_HOST_GUARD_FORCE_DISABLE = true
+	}
+
+	//配置和提取安全路径入口开关
+	if config.IsSet("security.entry_enable") {
+		global.GWAF_SECURITY_ENTRY_ENABLE = config.GetBool("security.entry_enable")
+	} else {
+		config.Set("security.entry_enable", global.GWAF_SECURITY_ENTRY_ENABLE)
+		configChanged = true
+	}
+
+	//配置和提取安全路径
+	if config.IsSet("security.entry_path") {
+		global.GWAF_SECURITY_ENTRY_PATH = config.GetString("security.entry_path")
+	} else {
+		config.Set("security.entry_path", global.GWAF_SECURITY_ENTRY_PATH)
+		configChanged = true
+	}
+
+	//如果启用了安全路径但路径为空，自动生成18位随机码
+	if global.GWAF_SECURITY_ENTRY_ENABLE && global.GWAF_SECURITY_ENTRY_PATH == "" {
+		global.GWAF_SECURITY_ENTRY_PATH = generateSecurityEntryPath()
+		config.Set("security.entry_path", global.GWAF_SECURITY_ENTRY_PATH)
+		configChanged = true
+		fmt.Printf("%s\tINFO\t安全路径入口已启用，自动生成访问码: %s\n", currentTime, global.GWAF_SECURITY_ENTRY_PATH)
+	}
+
+	//配置和提取应急路径
+	if config.IsSet("security.emergency_path") {
+		global.GWAF_SECURITY_EMERGENCY_PATH = config.GetString("security.emergency_path")
+	} else {
+		config.Set("security.emergency_path", "")
+		configChanged = true
+	}
+	//应急路径为空时自动生成（首次启动或手动清空后重启均会重新生成）
+	if global.GWAF_SECURITY_EMERGENCY_PATH == "" {
+		global.GWAF_SECURITY_EMERGENCY_PATH = generateSecurityEntryPath()
+		config.Set("security.emergency_path", global.GWAF_SECURITY_EMERGENCY_PATH)
+		configChanged = true
+		fmt.Printf("%s\tINFO\t应急恢复路径已生成: %s\n", currentTime, global.GWAF_SECURITY_EMERGENCY_PATH)
+	}
+
+	// Cache后端配置
+	if config.IsSet("cache.type") {
+		global.GCACHE_TYPE = config.GetString("cache.type")
+	} else {
+		config.Set("cache.type", global.GCACHE_TYPE)
+		configChanged = true
+	}
+	if config.IsSet("cache.redis.host") {
+		global.GCACHE_REDIS_HOST = config.GetString("cache.redis.host")
+	}
+	if config.IsSet("cache.redis.port") {
+		global.GCACHE_REDIS_PORT = config.GetInt("cache.redis.port")
+	}
+	if config.IsSet("cache.redis.password") {
+		global.GCACHE_REDIS_PASSWORD = config.GetString("cache.redis.password")
+	}
+	if config.IsSet("cache.redis.pool_size") {
+		global.GCACHE_REDIS_POOL_SIZE = config.GetInt("cache.redis.pool_size")
+	}
+	if config.IsSet("cache.redis.pool_timeout_seconds") {
+		global.GCACHE_REDIS_POOL_TIMEOUT_SEC = config.GetInt("cache.redis.pool_timeout_seconds")
+	}
+	if config.IsSet("cache.redis.op_timeout_seconds") {
+		global.GCACHE_REDIS_OP_TIMEOUT_SEC = config.GetInt("cache.redis.op_timeout_seconds")
+	}
+	if config.IsSet("cache.redis.db") {
+		global.GCACHE_REDIS_DB = config.GetInt("cache.redis.db")
+	}
+
+	// 只有在配置发生变化时才写入文件
+	if configChanged {
+		err := config.WriteConfig()
+		if err != nil {
+			fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+			return
+		}
+		fmt.Printf("%s\tINFO\t config updated\n", currentTime)
+		configChanged = false
+	}
+
+	fmt.Printf("%s\tINFO\tuser_code:%s ,soft_id:%s\n",
+		currentTime, global.GWAF_USER_CODE, global.GWAF_TENANT_ID)
+
+	// ── 数据库 driver 配置 ──────────────────────────────────────────────
+	if config.IsSet("database.driver") {
+		global.GWAF_DB_DRIVER = config.GetString("database.driver")
+	} else {
+		config.Set("database.driver", global.GWAF_DB_DRIVER) // 写入默认值 sqlite
+		configChanged = true
+	}
+
+	if global.GWAF_DB_DRIVER == "mysql" {
+		// MySQL 连接参数（有默认值，仅在 config.yml 有对应键时才覆盖）
+		if config.IsSet("database.mysql.host") {
+			global.GWAF_MYSQL_HOST = config.GetString("database.mysql.host")
+		}
+		if config.IsSet("database.mysql.port") {
+			global.GWAF_MYSQL_PORT = config.GetInt("database.mysql.port")
+		}
+		if config.IsSet("database.mysql.user") {
+			global.GWAF_MYSQL_USER = config.GetString("database.mysql.user")
+		}
+		if config.IsSet("database.mysql.password") {
+			global.GWAF_MYSQL_PASSWORD = config.GetString("database.mysql.password")
+		}
+		if config.IsSet("database.mysql.charset") {
+			global.GWAF_MYSQL_CHARSET = config.GetString("database.mysql.charset")
+		}
+		if config.IsSet("database.mysql.core_db") {
+			global.GWAF_MYSQL_CORE_DB = config.GetString("database.mysql.core_db")
+		}
+		if config.IsSet("database.mysql.log_db") {
+			global.GWAF_MYSQL_LOG_DB = config.GetString("database.mysql.log_db")
+		}
+		if config.IsSet("database.mysql.stats_db") {
+			global.GWAF_MYSQL_STATS_DB = config.GetString("database.mysql.stats_db")
+		}
+		if config.IsSet("database.mysql.max_open_conns") {
+			global.GWAF_MYSQL_MAX_OPEN_CONNS = config.GetInt("database.mysql.max_open_conns")
+		}
+		if config.IsSet("database.mysql.max_idle_conns") {
+			global.GWAF_MYSQL_MAX_IDLE_CONNS = config.GetInt("database.mysql.max_idle_conns")
+		}
+		if config.IsSet("database.mysql.conn_max_lifetime_minutes") {
+			global.GWAF_MYSQL_CONN_MAX_LIFETIME_MINUTES = config.GetInt("database.mysql.conn_max_lifetime_minutes")
+		}
+	}
+
+	if global.GWAF_DB_DRIVER == "postgres" {
+		// PostgreSQL 连接参数（有默认值，仅在 config.yml 有对应键时才覆盖）
+		if config.IsSet("database.postgres.host") {
+			global.GWAF_PG_HOST = config.GetString("database.postgres.host")
+		}
+		if config.IsSet("database.postgres.port") {
+			global.GWAF_PG_PORT = config.GetInt("database.postgres.port")
+		}
+		if config.IsSet("database.postgres.user") {
+			global.GWAF_PG_USER = config.GetString("database.postgres.user")
+		}
+		if config.IsSet("database.postgres.password") {
+			global.GWAF_PG_PASSWORD = config.GetString("database.postgres.password")
+		}
+		if config.IsSet("database.postgres.sslmode") {
+			global.GWAF_PG_SSLMODE = config.GetString("database.postgres.sslmode")
+		}
+		if config.IsSet("database.postgres.timezone") {
+			global.GWAF_PG_TIMEZONE = config.GetString("database.postgres.timezone")
+		}
+		if config.IsSet("database.postgres.maintenance_db") {
+			global.GWAF_PG_MAINTENANCE_DB = config.GetString("database.postgres.maintenance_db")
+		}
+		if config.IsSet("database.postgres.core_db") {
+			global.GWAF_PG_CORE_DB = config.GetString("database.postgres.core_db")
+		}
+		if config.IsSet("database.postgres.log_db") {
+			global.GWAF_PG_LOG_DB = config.GetString("database.postgres.log_db")
+		}
+		if config.IsSet("database.postgres.stats_db") {
+			global.GWAF_PG_STATS_DB = config.GetString("database.postgres.stats_db")
+		}
+		if config.IsSet("database.postgres.max_open_conns") {
+			global.GWAF_PG_MAX_OPEN_CONNS = config.GetInt("database.postgres.max_open_conns")
+		}
+		if config.IsSet("database.postgres.max_idle_conns") {
+			global.GWAF_PG_MAX_IDLE_CONNS = config.GetInt("database.postgres.max_idle_conns")
+		}
+		if config.IsSet("database.postgres.conn_max_lifetime_minutes") {
+			global.GWAF_PG_CONN_MAX_LIFETIME_MINUTES = config.GetInt("database.postgres.conn_max_lifetime_minutes")
+		}
+	}
+
+	// 只有在配置发生变化时才写入文件（提前写，dialect 注册在下方）
+	if configChanged {
+		err := config.WriteConfig()
+		if err != nil {
+			fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+			return
+		}
+		fmt.Printf("%s\tINFO\t config updated\n", currentTime)
+		configChanged = false // 已写，重置标志
+	}
+
+	// 注册数据库方言
+	switch global.GWAF_DB_DRIVER {
+	case "mysql":
+		dialect.Register(&dialect.MySQLDialect{})
+		fmt.Printf("%s\tINFO\t数据库驱动: MySQL (%s:%d)\n",
+			currentTime, global.GWAF_MYSQL_HOST, global.GWAF_MYSQL_PORT)
+	case "postgres":
+		dialect.Register(&dialect.PostgresDialect{})
+		// 时区必须打出来：它决定 timestamptz 的渲染时区，配错不会报错，
+		// 只会让界面上所有时间静默偏移，是最难发现的一类问题。
+		fmt.Printf("%s\tINFO\t数据库驱动: PostgreSQL (%s:%d, timezone=%s)\n",
+			currentTime, global.GWAF_PG_HOST, global.GWAF_PG_PORT, global.GWAF_PG_TIMEZONE)
+	case "sqlite", "":
+		dialect.Register(&dialect.SQLiteDialect{})
+	default:
+		// 不认识的 driver 不能静默降级成 SQLite：那样 "postgre" 这种笔误会让用户
+		// 以为在跑 PG，实际数据全写进了本地 SQLite 文件。
+		fmt.Printf("%s\tWARN\t未知的数据库驱动 %q，已回退到 SQLite。可选值: sqlite | mysql | postgres\n",
+			currentTime, global.GWAF_DB_DRIVER)
+		global.GWAF_DB_DRIVER = "sqlite"
+		dialect.Register(&dialect.SQLiteDialect{})
+	}
+}
+
+// UpdateIpWhitelist 更新IP白名单配置
+func UpdateIpWhitelist(ipWhitelist string) error {
+	// 格式化当前时间为指定格式
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	// 判断配置目录是否存在
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir) // 文件所在目录
+	config.SetConfigName("config")  // 文件名
+	config.SetConfigType("yml")     // 文件类型
+
+	// 读取配置文件
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			err = config.SafeWriteConfig()
+			if err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	// 更新IP白名单配置
+	config.Set("security.ip_whitelist", ipWhitelist)
+
+	// 更新全局变量
+	global.GWAF_IP_WHITELIST = ipWhitelist
+
+	// 写入配置文件
+	err := config.WriteConfig()
+	if err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tIP whitelist config updated\n", currentTime)
+
+	return nil
+}
+
+// UpdateManageTrustedProxies 更新管理端可信代理网段配置（写入 conf/config.yml 并立即生效）。
+// 与 IP 白名单一样存 config.yml：既可前端编辑，也可在被白名单挡住时改文件+重启自救。
+func UpdateManageTrustedProxies(trustedProxies string) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			if err = config.SafeWriteConfig(); err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	config.Set("security.manage_trusted_proxies", trustedProxies)
+	global.GCONFIG_MANAGE_TRUSTED_PROXIES = trustedProxies
+
+	if err := config.WriteConfig(); err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tmanage trusted proxies config updated\n", currentTime)
+	return nil
+}
+
+// UpdateManageCDNProvider 更新管理端引用的 CDN 厂商码（写入 conf/config.yml 并立即生效）。
+// 设置后 GetManageClientIP 额外信任该厂商中心库最新回源段；留空=不引用任何 CDN。
+func UpdateManageCDNProvider(provider string) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			if err = config.SafeWriteConfig(); err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	config.Set("security.manage_cdn_provider", provider)
+	global.GCONFIG_MANAGE_CDN_PROVIDER = provider
+
+	if err := config.WriteConfig(); err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tmanage cdn provider config updated\n", currentTime)
+	return nil
+}
+
+// UpdateCorsAllowOrigins 更新 CORS 跨域来源白名单（写入 conf/config.yml 并立即生效）。
+// 同 IP 白名单/可信代理存 config.yml：既可前端编辑，也可在(异地部署)跨域配错连不上时改文件+重启自救。
+func UpdateCorsAllowOrigins(origins string) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			if err = config.SafeWriteConfig(); err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	config.Set("security.cors_allow_origins", origins)
+	global.GCONFIG_CORS_ALLOW_ORIGINS = origins
+
+	if err := config.WriteConfig(); err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tcors allow origins config updated\n", currentTime)
+	return nil
+}
+
+// UpdateDomainWhitelist 更新域名白名单配置
+func UpdateDomainWhitelist(domainWhitelist string) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			if err = config.SafeWriteConfig(); err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	config.Set("security.domain_whitelist", domainWhitelist)
+	global.GWAF_DOMAIN_WHITELIST = domainWhitelist
+
+	if err := config.WriteConfig(); err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tDomain whitelist config updated\n", currentTime)
+	return nil
+}
+
+// UpdateSslEnable 更新SSL启用状态配置
+func UpdateSslEnable(sslEnable bool) error {
+	// 格式化当前时间为指定格式
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	// 判断配置目录是否存在
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir) // 文件所在目录
+	config.SetConfigName("config")  // 文件名
+	config.SetConfigType("yml")     // 文件类型
+
+	// 读取配置文件
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			err = config.SafeWriteConfig()
+			if err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	// 更新SSL启用状态配置
+	config.Set("security.ssl_enable", sslEnable)
+
+	// 更新全局变量
+	global.GWAF_SSL_ENABLE = sslEnable
+
+	// 写入配置文件
+	err := config.WriteConfig()
+	if err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tSSL enable config updated\n", currentTime)
+
+	return nil
+}
+
+// UpdateSslForceHttps 更新管理端仅允许HTTPS开关（需重启管理端生效）
+func UpdateSslForceHttps(forceHttps bool) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			err = config.SafeWriteConfig()
+			if err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	config.Set("security.ssl_force_https", forceHttps)
+	global.GWAF_SSL_FORCE_HTTPS = forceHttps
+
+	err := config.WriteConfig()
+	if err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tSSL force https config updated\n", currentTime)
+	return nil
+}
+
+// UpdateSslBindCertId 更新管理端证书绑定的证书夹ID（空字符串表示解绑）
+func UpdateSslBindCertId(bindCertId string) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			err = config.SafeWriteConfig()
+			if err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	config.Set("security.ssl_bind_cert_id", bindCertId)
+	global.GWAF_SSL_BIND_CERT_ID = bindCertId
+
+	err := config.WriteConfig()
+	if err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tSSL bind cert id config updated\n", currentTime)
+	return nil
+}
+
+// UpdateSecurityEntry 更新安全路径入口配置
+// entryEnable: 是否启用安全路径
+// entryPath: 安全路径码，传空字符串时若 entryEnable=true 则自动生成18位随机码
+func UpdateSecurityEntry(entryEnable bool, entryPath string) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			err = config.SafeWriteConfig()
+			if err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	// 如果启用且路径为空，自动生成18位随机码
+	if entryEnable && entryPath == "" {
+		entryPath = generateSecurityEntryPath()
+		fmt.Printf("%s\tINFO\t安全路径已启用，自动生成访问码: %s\n", currentTime, entryPath)
+	}
+
+	config.Set("security.entry_enable", entryEnable)
+	config.Set("security.entry_path", entryPath)
+
+	// 更新全局变量（立即生效，无需重启）
+	global.GWAF_SECURITY_ENTRY_ENABLE = entryEnable
+	global.GWAF_SECURITY_ENTRY_PATH = entryPath
+
+	err := config.WriteConfig()
+	if err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tsecurity entry config updated: enable=%v path=%s\n", currentTime, entryEnable, entryPath)
+	return nil
+}
+
+// UpdateNoticeTitle 更新通知消息标题前缀配置（立即生效）
+func UpdateNoticeTitle(title string) error {
+	currentTime := time.Now().Format("2006-01-02 15:04:05.000")
+
+	configDir := utils.GetCurrentDir() + "/conf/"
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+			fmt.Printf("%s\tERROR\t创建config目录失败:%v\n", currentTime, err)
+			return err
+		}
+	}
+
+	config := viper.New()
+	config.AddConfigPath(configDir)
+	config.SetConfigName("config")
+	config.SetConfigType("yml")
+
+	if err := config.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			fmt.Printf("%s\tWARN\t找不到配置文件..\n", currentTime)
+			config.Set("local_port", global.GWAF_LOCAL_SERVER_PORT)
+			err = config.SafeWriteConfig()
+			if err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("%s\tERROR\t配置文件出错..\n", currentTime)
+			return err
+		}
+	}
+
+	config.Set("notice.title", title)
+
+	// 立即更新全局变量，无需重启
+	global.GWAF_NOTICE_TITLE = title
+
+	err := config.WriteConfig()
+	if err != nil {
+		fmt.Printf("%s\tERROR\twrite config failed:%v\n", currentTime, err)
+		return err
+	}
+
+	fmt.Printf("%s\tINFO\tnotice title config updated: %s\n", currentTime, title)
+	return nil
+}

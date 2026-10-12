@@ -1,0 +1,628 @@
+<template>
+  <div>
+    <t-card class="list-card-container">
+      <t-row justify="space-between">
+        <div class="left-operation-container">
+          <t-button @click="handleAddurlblock"> {{ $t('page.urlblock.button_add_url') }} </t-button>
+          <t-button theme="danger" :disabled="selectedRowKeys.length === 0" @click="handleBatchDelete">
+            {{ $t('page.urlblock.button_batch_delete') }}
+          </t-button>
+          <t-button theme="danger" @click="handleClearAll" :disabled="data.length === 0">
+            {{ $t('page.urlblock.button_clear_all') }}
+          </t-button>
+        </div>
+        <div class="right-operation-container">
+          <t-form ref="form" :data="searchformData" :label-width="80" layout="inline" colon :style="{ marginBottom: '8px' }">
+            <t-form-item :label="$t('page.urlblock.label_website')" name="host_code">
+              <t-select v-model="searchformData.host_code" clearable filterable :style="{ width: '150px' }">
+                <t-option v-for="(item, index) in host_dic" :value="index" :label="item" :key="index">
+                  {{ item }}
+                </t-option>
+              </t-select>
+            </t-form-item>
+            <t-form-item :label="$t('page.urlblock.label_url')" name="url">
+              <t-input v-model="searchformData.url" class="search-input" clearable>
+              </t-input>
+            </t-form-item>
+            <t-form-item>
+              <t-button theme="primary" :style="{ marginLeft: '8px' }" @click="getList('all')">
+                {{ $t('common.search') }}
+              </t-button>
+            </t-form-item>
+          </t-form>
+        </div>
+      </t-row>
+      <help-block :summary="$t('page.urlblock.alert_message')" doc="guide/UrlBlack" />
+      <div class="table-container">
+        <t-table :columns="columns" :data="data" :rowKey="rowKey" :verticalAlign="verticalAlign" :hover="hover"
+          :pagination="pagination" :selected-row-keys="selectedRowKeys" :loading="dataLoading"
+          @page-change="rehandlePageChange" @change="rehandleChange" @select-change="rehandleSelectChange"
+          :headerAffixedTop="true" :headerAffixProps="{ offsetTop: offsetTop, container: getContainer }">
+
+          <template #host_code="{ row }">
+            <span> {{host_dic[row.host_code]}}</span>
+          </template>
+
+          <template #op="slotProps">
+            <a class="t-button-link" @click="handleClickEdit(slotProps)">{{ $t('common.edit') }}</a>
+            <a class="t-button-link" @click="handleClickDelete(slotProps)">{{ $t('common.delete') }}</a>
+          </template>
+        </t-table>
+      </div>
+      <div>
+      <router-view></router-view>
+      </div>
+    </t-card>
+
+    <t-dialog :header="$t('common.new')" :visible.sync="addFormVisible" :width="680" :footer="false">
+      <div slot="body">
+        <t-form :data="formData" ref="form" :rules="rules" @submit="onSubmit" :labelWidth="100">
+          <t-form-item :label="$t('page.urlblock.label_website')" name="host_code">
+            <t-select v-model="formData.host_code" clearable filterable :style="{ width: '480px' }">
+              <t-option v-for="(item, index) in host_dic" :value="index" :label="item"
+                :key="index">
+                {{ item }}
+              </t-option>
+            </t-select>
+          </t-form-item>
+          <t-form-item :label="$t('page.urlblock.label_compare_type')" name="compare_type">
+            <t-select v-model="formData.compare_type" clearable :style="{ width: '480px' }">
+              <t-option v-for="(item, index) in compare_type_options" :value="item.value" :label="item.label"
+                        :key="index">
+                {{ item.label }}
+              </t-option>
+            </t-select>
+          </t-form-item>
+          <t-form-item :label="$t('page.urlblock.label_url')" name="url">
+            <t-input :style="{ width: '480px' }" v-model="formData.url"  ></t-input>
+          </t-form-item>
+          <t-form-item :label="$t('common.remarks')" name="remarks">
+            <t-textarea :style="{ width: '480px' }" v-model="formData.remarks"   name="remarks">
+            </t-textarea>
+          </t-form-item>
+          <t-form-item style="float: right">
+            <t-button variant="outline" @click="onClickCloseBtn">{{ $t('common.close') }}</t-button>
+            <t-button theme="primary" type="submit">{{ $t('common.confirm') }}</t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+    </t-dialog>
+
+    <t-dialog :header="$t('common.edit')" :visible.sync="editFormVisible" :width="680" :footer="false">
+      <div slot="body">
+        <t-form :data="formEditData" ref="form" :rules="rules" @submit="onSubmitEdit" :labelWidth="100">
+          <t-form-item :label="$t('page.urlblock.label_website')" name="host_code">
+            <t-select v-model="formEditData.host_code" clearable filterable :style="{ width: '480px' }">
+              <t-option v-for="(item, index) in host_dic" :value="index" :label="item"
+                :key="index">
+                {{ item }}
+              </t-option>
+            </t-select>
+          </t-form-item>
+          <t-form-item :label="$t('page.urlblock.label_compare_type')" name="compare_type">
+            <t-select v-model="formEditData.compare_type" clearable :style="{ width: '480px' }">
+              <t-option v-for="(item, index) in compare_type_options" :value="item.value" :label="item.label"
+                        :key="index">
+                {{ item.label }}
+              </t-option>
+            </t-select>
+          </t-form-item>
+         <t-form-item  :label="$t('page.urlblock.label_url')"  name="url">
+           <t-input :style="{ width: '480px' }" v-model="formEditData.url" ></t-input>
+         </t-form-item>
+          <t-form-item :label="$t('common.remarks')"  name="remarks">
+            <t-textarea :style="{ width: '480px' }" v-model="formEditData.remarks"   name="remarks">
+            </t-textarea>
+          </t-form-item>
+          <t-form-item style="float: right">
+            <t-button variant="outline" @click="onClickCloseEditBtn">{{ $t('common.close') }}</t-button>
+            <t-button theme="primary" type="submit">{{ $t('common.confirm') }}</t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+    </t-dialog>
+
+    <t-dialog :header="$t('common.confirm_delete')" :body="confirmBody" :visible.sync="confirmVisible" @confirm="onConfirmDelete"
+      :onCancel="onCancel">
+    </t-dialog>
+     <t-dialog :header="$t('page.urlblock.confirm_batch_delete')" :visible.sync="batchDeleteVisible" 
+      @confirm="onConfirmBatchDelete" @cancel="onCancelBatchDelete">
+      <div slot="body">
+        {{ $t('page.urlblock.confirm_batch_delete') }}
+      </div>
+    </t-dialog>
+    
+    <t-dialog :header="$t('page.urlblock.confirm_clear_all')" :visible.sync="clearAllVisible" 
+      @confirm="onConfirmClearAll" @cancel="onCancelClearAll">
+      <div slot="body">
+        {{ $t('page.urlblock.confirm_clear_all') }}
+      </div>
+    </t-dialog>
+  </div>
+</template>
+<script lang="ts">
+  import Vue from 'vue';
+  import {
+    SearchIcon
+  } from 'tdesign-icons-vue';
+  import Trend from '@/components/trend/index.vue';
+  import {
+    prefix
+  } from '@/config/global';
+  import {
+    allhost
+  } from '@/apis/host';
+  import {
+    wafURLBlockListApi,wafURLBlockDelApi,wafURLBlockEditApi,wafURLBlockAddApi,wafURLBlockDetailApi,
+    wafURLBlockBatchDelApi,wafURLBlockDelAllApi
+  } from '@/apis/urlblock';
+  import {
+    SSL_STATUS,
+    GUARD_STATUS,
+    CONTRACT_STATUS,
+    CONTRACT_STATUS_OPTIONS,
+    CONTRACT_TYPES,
+    CONTRACT_PAYMENT_TYPES
+  } from '@/constants';
+
+  const INITIAL_DATA = {
+    host_code: '',
+    url: '',
+    remarks: '',
+    compare_type:"等于"
+  };
+  export default Vue.extend({
+    name: 'ListBase',
+    components: {
+      SearchIcon,
+      Trend,
+    },
+    data() {
+      return {
+        addFormVisible: false,
+        editFormVisible: false,
+        guardVisible: false,
+        confirmVisible: false,
+        batchDeleteVisible: false,
+        clearAllVisible: false,
+        formData: {
+          ...INITIAL_DATA
+        },
+        formEditData: {
+          ...INITIAL_DATA
+        },
+        rules: {
+          host_code: [{
+            required: true,
+            message: this.$t('common.select_placeholder')+this.$t('page.urlblock.label_website'),
+            type: 'error'
+          }],
+          compare_type: [{
+            required: true,
+            message: this.$t('common.select_placeholder'),
+            type: 'error'
+          }],
+          url: [{
+            required: true,
+            message: this.$t('common.select_placeholder')+this.$t('page.urlblock.label_url'),
+            type: 'error'
+          }],
+        },
+
+        compare_type_options: [{
+          label: this.$t('page.urlblock.compare_type_option_equal'),
+          value: '等于'
+        },
+          {
+            label: this.$t('page.urlblock.compare_type_option_pre'),
+            value: '前缀匹配'
+          },
+          {
+            label: this.$t('page.urlblock.compare_type_option_end'),
+            value: '后缀匹配'
+          },
+          {
+            label: this.$t('page.urlblock.compare_type_option_contain'),
+            value: '包含匹配'
+          },
+        ],
+        textareaValue: '',
+        prefix,
+        dataLoading: false,
+        data: [], //列表数据信息
+        detail_data: [], //加载详情信息用于编辑
+        selectedRowKeys: [],
+        value: 'first',
+        columns: [
+          { colKey: 'row-select', type: 'multiple', width: 64, fixed: 'left' },
+          {
+            title: this.$t('page.urlblock.label_website'),
+            align: 'left',
+            width: 250,
+            ellipsis: true,
+            colKey: 'host_code',
+          },{
+            title: this.$t('page.urlblock.label_compare_type'),
+            align: 'left',
+            width: 250,
+            ellipsis: true,
+            colKey: 'compare_type',
+          },
+          {
+            title: this.$t('page.urlblock.label_url'),
+            width: 200,
+            ellipsis: true,
+            colKey: 'url',
+          },
+          {
+            title: this.$t('common.remarks'),
+            width: 200,
+            ellipsis: true,
+            colKey: 'remarks',
+          },
+          {
+            title: this.$t('common.create_time'),
+            width: 200,
+            ellipsis: true,
+            colKey: 'create_time',
+          },
+
+          {
+            align: 'left',
+            width: 200,
+            colKey: 'op',
+            title: this.$t('common.op'),
+          },
+        ],
+        rowKey: 'id',
+        tableLayout: 'auto',
+        verticalAlign: 'top',
+        hover: true,
+        rowClassName: (rowKey: string) => `${rowKey}-class`,
+        // 与pagination对齐
+        pagination: {
+          total: 0,
+          current: 1,
+          pageSize: 10
+        },
+        //顶部搜索
+        searchformData: {
+          url:"",
+          host_code:""
+        },
+        //索引区域
+        deleteIdx: -1,
+        guardStatusIdx :-1,
+        //主机字典
+        host_dic:{}
+      };
+    },
+    computed: {
+      confirmBody() {
+        if (this.deleteIdx > -1) {
+          const {
+            url
+          } = this.data?. [this.deleteIdx];
+          return this.$t('common.confirm_delete');
+        }
+        return '';
+      },
+      offsetTop() {
+        return this.$store.state.setting.isUseTabsRouter ? 48 : 0;
+      },
+    },
+    mounted() {
+      this.loadHostList().then(() => {
+        this.getList("");
+      });
+    },
+    methods: {
+      loadHostList() {
+        return new Promise((resolve, reject) => {
+          allhost()
+            .then((res) => {
+              let resdata = res;
+              console.log(resdata);
+              if (resdata.code === 0) {
+                let host_options = resdata.data;
+                for (let i = 0; i < host_options.length; i++) {
+                  this.host_dic[host_options[i].value] = host_options[i].label;
+                }
+              }
+              resolve(); // 调用 resolve 表示加载完成
+            })
+            .catch((e: Error) => {
+              console.log(e);
+              reject(e); // 调用 reject 表示加载失败
+            });
+        });
+      },
+      getList(keyword) {
+        let that = this
+        wafURLBlockListApi({
+              pageSize: that.pagination.pageSize,
+              pageIndex: that.pagination.current,
+              ...that.searchformData
+          })
+          .then((res) => {
+            let resdata = res
+            console.log(resdata)
+            if (resdata.code === 0) {
+
+              this.data = resdata.data.list??[];
+              this.data_attach = []
+              console.log('getList',this.data)
+              this.pagination = {
+                ...this.pagination,
+                total: resdata.data.total,
+              };
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+          })
+          .finally(() => {
+            this.dataLoading = false;
+          });
+        this.dataLoading = true;
+      },
+      getContainer() {
+        return document.querySelector('.tdesign-starter-layout');
+      },
+      rehandlePageChange(curr, pageInfo) {
+        this.pagination.current = curr.current
+        if (this.pagination.pageSize != curr.pageSize) {
+          this.pagination.current = 1
+          this.pagination.pageSize = curr.pageSize
+        }
+        this.getList("")
+      },
+      rehandleSelectChange(selectedRowKeys: number[]) {
+        this.selectedRowKeys = selectedRowKeys;
+      },
+      rehandleChange(changeParams, triggerAndData) {
+      },
+      handleClickEdit(e) {
+        console.log(e)
+        const {
+          id
+        } = e.row
+        console.log(id)
+        this.editFormVisible = true
+        this.getDetail(id)
+      },
+      handleAddurlblock() {
+        this.addFormVisible = true
+        this.formData =  {
+          host_code: '',
+          url: '',
+          remarks: '',
+        };
+      },
+      onSubmit({
+        result,
+        firstError
+      }): void {
+        let that = this
+        if (!firstError) {
+
+          let postdata = {
+            ...that.formData
+          }
+          wafURLBlockAddApi( {
+              ...postdata
+            })
+            .then((res) => {
+              let resdata = res
+              console.log(resdata)
+              if (resdata.code === 0) {
+                that.$message.success(resdata.msg);
+                that.addFormVisible = false;
+                that.pagination.current = 1
+                that.getList("")
+              } else {
+                that.$message.warning(resdata.msg);
+              }
+            })
+            .catch((e: Error) => {
+              console.log(e);
+            })
+            .finally(() => {});
+        } else {
+          console.log('Errors: ', result);
+          that.$message.warning(firstError);
+        }
+      },
+      onSubmitEdit({
+        result,
+        firstError
+      }): void {
+        let that = this
+        if (!firstError) {
+
+          let postdata = {
+            ...that.formEditData
+          }
+          wafURLBlockEditApi({
+              ...postdata
+            })
+            .then((res) => {
+              let resdata = res
+              console.log(resdata)
+              if (resdata.code === 0) {
+                that.$message.success(resdata.msg);
+                that.editFormVisible = false;
+                that.getList("")
+              } else {
+                that.$message.warning(resdata.msg);
+              }
+            })
+            .catch((e: Error) => {
+              console.log(e);
+            })
+            .finally(() => {});
+        } else {
+          console.log('Errors: ', result);
+          that.$message.warning(firstError);
+        }
+      },
+      onClickCloseBtn(): void {
+        this.addFormVisible = false;
+        this.formData = {...INITIAL_DATA};
+      },
+      onClickCloseEditBtn(): void {
+        this.editFormVisible = false;
+        this.formEditData = {...INITIAL_DATA};
+      },
+      handleClickDelete(row) {
+        console.log(row)
+        this.deleteIdx = row.rowIndex;
+        this.confirmVisible = true;
+      },
+      onConfirmDelete() {
+        this.confirmVisible = false;
+        console.log('delete', this.data)
+        console.log('delete', this.data[this.deleteIdx])
+        let {
+          id
+        } = this.data[this.deleteIdx]
+        let that = this
+        wafURLBlockDelApi({
+              id: id
+          })
+          .then((res) => {
+            let resdata = res
+            console.log(resdata)
+            if (resdata.code === 0) {
+
+              that.getList("")
+              that.$message.success(resdata.msg);
+            } else {
+              that.$message.warning(resdata.msg);
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+          })
+          .finally(() => {});
+
+
+        this.resetIdx();
+      },
+      onCancel() {
+        this.resetIdx();
+      },
+      resetIdx() {
+        this.deleteIdx = -1;
+      },
+      getDetail(id) {
+        let that = this
+        wafURLBlockDetailApi( {
+              id: id
+          })
+          .then((res) => {
+            let resdata = res
+            console.log(resdata)
+            if (resdata.code === 0) {
+              that.detail_data = resdata.data;
+              that.formEditData = {
+                ...that.detail_data
+              }
+            }
+          })
+          .catch((e: Error) => {
+            console.log(e);
+          })
+          .finally(() => {});
+      },
+      handleBatchDelete() {
+        if (this.selectedRowKeys.length === 0) {
+          this.$message.warning(this.$t('page.urlblock.no_data_selected'));
+          return;
+        }
+        this.batchDeleteVisible = true;
+      },
+      
+      handleClearAll() { 
+        this.clearAllVisible = true;
+      },
+      
+      onConfirmBatchDelete() {
+        this.batchDeleteVisible = false;
+        let that = this;
+ 
+        const ids = this.selectedRowKeys.map(key => {
+          const item = this.data.find(d => d.id === key);
+          return item ? item.id : null;
+        }).filter(id => id !== null);
+
+        wafURLBlockBatchDelApi({ ids: ids })
+        .then((res) => {
+          let resdata = res;
+          if (resdata.code === 0) {
+            that.$message.success(this.$t('page.urlblock.batch_delete_success'));
+            that.selectedRowKeys = [];
+            that.getList("");
+          } else {
+            that.$message.warning(resdata.msg);
+          }
+        })
+        .catch((e: Error) => {
+          console.log(e);
+        });
+      },
+      
+      onConfirmClearAll() {
+        this.clearAllVisible = false;
+        let that = this;
+        wafURLBlockDelAllApi({
+          host_code: this.searchformData.host_code
+        })
+        .then((res) => {
+          let resdata = res;
+          if (resdata.code === 0) {
+            that.$message.success(this.$t('page.urlblock.clear_all_success'));
+            that.selectedRowKeys = [];
+            that.getList("");
+          } else {
+            that.$message.warning(resdata.msg);
+          }
+        })
+        .catch((e: Error) => {
+          console.log(e);
+        });
+      },
+      
+      onCancelBatchDelete() {
+        this.batchDeleteVisible = false;
+      },
+      
+      onCancelClearAll() {
+        this.clearAllVisible = false;
+      },
+      
+    },
+  });
+</script>
+
+<style lang="less" scoped>
+  @import '@/style/variables';
+  .left-operation-container {
+    padding: 0 0 6px 0;
+    margin-bottom: 16px;
+
+    .selected-count {
+      display: inline-block;
+      margin-left: 8px;
+      color: var(--td-text-color-secondary);
+    }
+  }
+
+  .search-input {
+    width: 360px;
+  }
+
+  .t-button+.t-button {
+    margin-left: @spacer;
+  }
+</style>

@@ -1,0 +1,717 @@
+package wafdb
+
+import (
+	"SamWaf/common/uuid"
+	"SamWaf/common/zlog"
+	"SamWaf/customtype"
+	"SamWaf/enums"
+	"SamWaf/global"
+	"SamWaf/model"
+	"SamWaf/model/baseorm"
+	"fmt"
+	"time"
+
+	"github.com/go-gormigrate/gormigrate/v2"
+	"gorm.io/gorm"
+)
+
+// RunTaskInitMigrations 执行任务初始化迁移
+func RunTaskInitMigrations(db *gorm.DB) error {
+	zlog.Info("开始执行任务初始化数据库迁移...")
+
+	m := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{
+		// 迁移1: 初始化系统任务
+		{
+			ID: "202601050002_init_system_tasks",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202601050002: 初始化系统任务")
+
+				// 定义系统任务列表
+				systemTasks := []model.Task{
+					// 每秒级别任务
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每1秒执行qps清空",
+						TaskUnit:   enums.TASK_SECOND,
+						TaskAt:     "",
+						TaskValue:  1,
+						TaskMethod: enums.TASK_RUNTIME_QPS_CLEAN,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每1秒重置QPS数据",
+						TaskUnit:   enums.TASK_SECOND,
+						TaskAt:     "",
+						TaskValue:  1,
+						TaskMethod: enums.TASK_HOST_QPS_CLEAN,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天10s进行一次统计",
+						TaskUnit:   enums.TASK_SECOND,
+						TaskValue:  10,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_COUNTER,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每10s推送系统统计数据",
+						TaskUnit:   enums.TASK_SECOND,
+						TaskValue:  10,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_STATS_PUSH,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每30s进行健康度检测",
+						TaskUnit:   enums.TASK_SECOND,
+						TaskValue:  30,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_HEALTH,
+					},
+					// 每分钟级别
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每1分钟进行一次延迟信息提取",
+						TaskUnit:   enums.TASK_MIN,
+						TaskValue:  10,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_DELAY_INFO,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每1分钟进行一次配置更新",
+						TaskUnit:   enums.TASK_MIN,
+						TaskValue:  1,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_LOAD_CONFIG,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每5分钟进行CCWindows旧信息清除",
+						TaskUnit:   enums.TASK_MIN,
+						TaskValue:  5,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_CLEAR_CC_WINDOWS,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每5分钟进行防火墙IP封禁规则清理",
+						TaskUnit:   enums.TASK_MIN,
+						TaskValue:  5,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_FIREWALL_CLEAN_EXPIRED,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天30分钟删除历史下载文件",
+						TaskUnit:   enums.TASK_MIN,
+						TaskValue:  30,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_DELETE_HISTORY_DOWNLOAD_FILE,
+					},
+					// 每小时级别
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每1小时进行一次微信提取accesstoken",
+						TaskUnit:   enums.TASK_HOUR,
+						TaskValue:  1,
+						TaskAt:     "",
+						TaskMethod: enums.TASK_REFLUSH_WECHAT_ACCESS_TOKEN,
+					},
+					// 每日定时级别
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天凌晨3点进行数据归档操作",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "03:00",
+						TaskMethod: enums.TASK_SHARE_DB,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天早5点删除历史信息",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "05:00",
+						TaskMethod: enums.TASK_DELETE_HISTORY_INFO,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天01:00进行GC回收",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "01:00",
+						TaskMethod: enums.TASK_GC,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天凌晨01:20进行数据库监控",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "01:20",
+						TaskMethod: enums.TASK_DB_MONITOR,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天02:13进行SSL证书申请",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "02:13",
+						TaskMethod: enums.TASK_SSL_ORDER_RENEW,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天03:00进行查询SSL绑定路径自动加载最新证书",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "03:00",
+						TaskMethod: enums.TASK_SSL_PATH_LOAD,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天05:00进行批量任务",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "05:00",
+						TaskMethod: enums.TASK_BATCH,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天06:00进行批量SSL过期检测",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "06:00",
+						TaskMethod: enums.TASK_SSL_EXPIRE_CHECK,
+					},
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:   "每天早8晚8进行通知(需要开启通知)",
+						TaskUnit:   enums.TASK_DAY,
+						TaskValue:  1,
+						TaskAt:     "08:00;20:00",
+						TaskMethod: enums.TASK_NOTICE,
+					},
+					// 每周级别
+					{
+						BaseOrm: baseorm.BaseOrm{
+							Id:          uuid.GenUUID(),
+							USER_CODE:   global.GWAF_USER_CODE,
+							Tenant_ID:   global.GWAF_TENANT_ID,
+							CREATE_TIME: customtype.JsonTime(time.Now()),
+							UPDATE_TIME: customtype.JsonTime(time.Now()),
+						},
+						TaskName:          "每周六晚上23:00进行web文件缓存清除",
+						TaskUnit:          enums.TASK_WEEKLY,
+						TaskValue:         1,
+						TaskAt:            "23:00",
+						TaskDaysOfTheWeek: "6",
+						TaskMethod:        enums.TASK_CLEAR_WEBCACHE,
+					},
+				}
+
+				// 插入或更新任务
+				for _, task := range systemTasks {
+					// 检查任务是否已存在
+					var count int64
+					tx.Model(&model.Task{}).Where("task_method = ?", task.TaskMethod).Count(&count)
+
+					if count == 0 {
+						// 任务不存在，插入新任务
+						if err := tx.Create(&task).Error; err != nil {
+							zlog.Warn("创建任务失败", "task", task.TaskName, "error", err.Error())
+							return fmt.Errorf("创建任务 %s 失败: %w", task.TaskName, err)
+						}
+						zlog.Info("任务创建成功", "task", task.TaskName)
+					} else if count > 1 {
+						// 如果存在重复的任务方法，先删除所有然后重新创建
+						zlog.Warn("发现重复任务，清理后重建", "task_method", task.TaskMethod, "count", count)
+						if err := tx.Where("task_method = ?", task.TaskMethod).Delete(&model.Task{}).Error; err != nil {
+							return fmt.Errorf("清理重复任务 %s 失败: %w", task.TaskName, err)
+						}
+						if err := tx.Create(&task).Error; err != nil {
+							return fmt.Errorf("重建任务 %s 失败: %w", task.TaskName, err)
+						}
+						zlog.Info("重复任务已清理并重建", "task", task.TaskName)
+					} else {
+						// 任务已存在，跳过
+						zlog.Debug("任务已存在，跳过", "task", task.TaskName)
+					}
+				}
+
+				zlog.Info("系统任务初始化完成", "任务总数", len(systemTasks))
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202601050002: 删除系统任务（保护用户自定义任务）")
+				systemTaskMethods := []string{
+					enums.TASK_RUNTIME_QPS_CLEAN,
+					enums.TASK_HOST_QPS_CLEAN,
+					enums.TASK_COUNTER,
+					enums.TASK_STATS_PUSH,
+					enums.TASK_HEALTH,
+					enums.TASK_DELAY_INFO,
+					enums.TASK_LOAD_CONFIG,
+					enums.TASK_CLEAR_CC_WINDOWS,
+					enums.TASK_FIREWALL_CLEAN_EXPIRED,
+					enums.TASK_DELETE_HISTORY_DOWNLOAD_FILE,
+					enums.TASK_REFLUSH_WECHAT_ACCESS_TOKEN,
+					enums.TASK_SHARE_DB,
+					enums.TASK_DELETE_HISTORY_INFO,
+					enums.TASK_GC,
+					enums.TASK_DB_MONITOR,
+					enums.TASK_SSL_ORDER_RENEW,
+					enums.TASK_SSL_PATH_LOAD,
+					enums.TASK_BATCH,
+					enums.TASK_SSL_EXPIRE_CHECK,
+					enums.TASK_MANAGER_CERT_CHECK,
+					enums.TASK_NOTICE,
+					enums.TASK_CLEAR_WEBCACHE,
+				}
+				return tx.Where("task_method IN ?", systemTaskMethods).Delete(&model.Task{}).Error
+			},
+		},
+		// 迁移2: 新增统计数据清理任务（独立迁移，兼容老用户）
+		{
+			ID: "202604100003_add_stats_cleanup_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202604100003: 新增统计数据清理任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_STATS_DATA_CLEANUP).Count(&count)
+				if count > 0 {
+					zlog.Info("统计清理任务已存在，跳过", "task_method", enums.TASK_STATS_DATA_CLEANUP)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每天凌晨04:30清理统计数据（按保留策略）",
+					TaskUnit:   enums.TASK_DAY,
+					TaskValue:  1,
+					TaskAt:     "04:30",
+					TaskMethod: enums.TASK_STATS_DATA_CLEANUP,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建统计清理任务失败: %w", err)
+				}
+				zlog.Info("统计数据清理任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202604100003: 删除统计数据清理任务")
+				return tx.Where("task_method = ?", enums.TASK_STATS_DATA_CLEANUP).Delete(&model.Task{}).Error
+			},
+		},
+		// 迁移3: 新增高频分库检测任务（每5分钟按文件大小切库，兼容老用户）
+		{
+			ID: "202606260004_add_share_db_check_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202606260004: 新增高频分库检测任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_SHARE_DB_CHECK).Count(&count)
+				if count > 0 {
+					zlog.Info("高频分库检测任务已存在，跳过", "task_method", enums.TASK_SHARE_DB_CHECK)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每5分钟按文件大小检测分库",
+					TaskUnit:   enums.TASK_MIN,
+					TaskValue:  5,
+					TaskAt:     "",
+					TaskMethod: enums.TASK_SHARE_DB_CHECK,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建高频分库检测任务失败: %w", err)
+				}
+				zlog.Info("高频分库检测任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202606260004: 删除高频分库检测任务")
+				return tx.Where("task_method = ?", enums.TASK_SHARE_DB_CHECK).Delete(&model.Task{}).Error
+			},
+		},
+		// 迁移4: 新增威胁情报IP订阅同步任务（每小时检查各渠道是否到期，兼容老用户）
+		{
+			ID: "202607160002_add_threat_ip_sync_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202607160002: 新增威胁情报IP订阅同步任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_THREAT_IP_SYNC).Count(&count)
+				if count > 0 {
+					zlog.Info("威胁情报订阅同步任务已存在，跳过", "task_method", enums.TASK_THREAT_IP_SYNC)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每1小时检查威胁情报IP订阅是否到期",
+					TaskUnit:   enums.TASK_HOUR,
+					TaskValue:  1,
+					TaskAt:     "",
+					TaskMethod: enums.TASK_THREAT_IP_SYNC,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建威胁情报订阅同步任务失败: %w", err)
+				}
+				zlog.Info("威胁情报订阅同步任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202607160002: 删除威胁情报订阅同步任务")
+				return tx.Where("task_method = ?", enums.TASK_THREAT_IP_SYNC).Delete(&model.Task{}).Error
+			},
+		},
+		// 迁移: 统一访问认证的数据清理任务
+		// 10 分钟一次：票据只活 60 秒，清理频率太低会让 access_ticket 表在高频 SSO 场景下堆积。
+		{
+			ID: "202608040003_add_access_clean_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202608040003: 创建统一访问认证清理任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_ACCESS_CLEAN).Count(&count)
+				if count > 0 {
+					zlog.Info("统一访问认证清理任务已存在，跳过", "task_method", enums.TASK_ACCESS_CLEAN)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每10分钟清理统一访问认证的过期会话/令牌/票据与审计日志",
+					TaskUnit:   enums.TASK_MIN,
+					TaskValue:  10,
+					TaskAt:     "",
+					TaskMethod: enums.TASK_ACCESS_CLEAN,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建统一访问认证清理任务失败: %w", err)
+				}
+				zlog.Info("统一访问认证清理任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202608040003: 删除统一访问认证清理任务")
+				return tx.Where("task_method = ?", enums.TASK_ACCESS_CLEAN).Delete(&model.Task{}).Error
+			},
+		},
+		// 迁移: 网站密码访问的会话清理任务
+		// 10 分钟一次：只做「把到期会话的状态标对 + 删超保留期的历史行」，
+		// 校验链路本来就独立判过期时间，这个任务跑不跑都不影响拦不拦。
+		{
+			ID: "202609040001_add_httpauth_clean_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202609040001: 创建网站密码访问会话清理任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_HTTPAUTH_CLEAN).Count(&count)
+				if count > 0 {
+					zlog.Info("网站密码访问会话清理任务已存在，跳过", "task_method", enums.TASK_HTTPAUTH_CLEAN)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每10分钟清理网站密码访问的到期会话与历史记录",
+					TaskUnit:   enums.TASK_MIN,
+					TaskValue:  10,
+					TaskAt:     "",
+					TaskMethod: enums.TASK_HTTPAUTH_CLEAN,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建网站密码访问会话清理任务失败: %w", err)
+				}
+				zlog.Info("网站密码访问会话清理任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202609040001: 删除网站密码访问会话清理任务")
+				return tx.Where("task_method = ?", enums.TASK_HTTPAUTH_CLEAN).Delete(&model.Task{}).Error
+			},
+		},
+		// 迁移: 站点流量计量落库任务
+		// 30 秒一次：内存里累计的真实进出字节按天/小时增量落库。周期越短掉进程时丢得越少，
+		// 但每轮只有 2N 条 UPDATE(N=有流量的站点数)，30 秒对 SQLite 毫无压力。
+		{
+			ID: "202608180001_add_traffic_flush_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202608180001: 创建站点流量落库任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_TRAFFIC_FLUSH).Count(&count)
+				if count > 0 {
+					zlog.Info("站点流量落库任务已存在，跳过", "task_method", enums.TASK_TRAFFIC_FLUSH)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每30秒把站点流量计量落库",
+					TaskUnit:   enums.TASK_SECOND,
+					TaskValue:  30,
+					TaskAt:     "",
+					TaskMethod: enums.TASK_TRAFFIC_FLUSH,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建站点流量落库任务失败: %w", err)
+				}
+				zlog.Info("站点流量落库任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202608180001: 删除站点流量落库任务")
+				return tx.Where("task_method = ?", enums.TASK_TRAFFIC_FLUSH).Delete(&model.Task{}).Error
+			},
+		},
+		// 迁移: 主机防爆破的到期解封任务
+		// 1 分钟一次：阶梯最短一级只有 5 分钟，沿用防火墙那个 5 分钟粒度的话，
+		// 用户会看到"明明写着封5分钟，实际封了10分钟"。
+		{
+			ID: "202608070003_add_hostguard_clean_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202608070003: 创建主机防爆破解封任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_HOSTGUARD_CLEAN_EXPIRED).Count(&count)
+				if count > 0 {
+					zlog.Info("主机防爆破解封任务已存在，跳过", "task_method", enums.TASK_HOSTGUARD_CLEAN_EXPIRED)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每1分钟解封主机防爆破中已到期的IP",
+					TaskUnit:   enums.TASK_MIN,
+					TaskValue:  1,
+					TaskAt:     "",
+					TaskMethod: enums.TASK_HOSTGUARD_CLEAN_EXPIRED,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建主机防爆破解封任务失败: %w", err)
+				}
+				zlog.Info("主机防爆破解封任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202608070003: 删除主机防爆破解封任务")
+				return tx.Where("task_method = ?", enums.TASK_HOSTGUARD_CLEAN_EXPIRED).Delete(&model.Task{}).Error
+			},
+		},
+		// 管理端证书检测：本地CA签的自动续期，绑定证书夹的交给既有ACME链路，手工上传的按阈值提醒。
+		// 单独一个任务是因为既有的 SSL 到期检测只覆盖被防护站点的域名列表，管理端自己的证书不在其中。
+		{
+			ID: "202608250001_add_manager_cert_task",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202608250001: 创建管理端证书检测任务")
+
+				var count int64
+				tx.Model(&model.Task{}).Where("task_method = ?", enums.TASK_MANAGER_CERT_CHECK).Count(&count)
+				if count > 0 {
+					zlog.Info("管理端证书检测任务已存在，跳过", "task_method", enums.TASK_MANAGER_CERT_CHECK)
+					return nil
+				}
+
+				task := model.Task{
+					BaseOrm: baseorm.BaseOrm{
+						Id:          uuid.GenUUID(),
+						USER_CODE:   global.GWAF_USER_CODE,
+						Tenant_ID:   global.GWAF_TENANT_ID,
+						CREATE_TIME: customtype.JsonTime(time.Now()),
+						UPDATE_TIME: customtype.JsonTime(time.Now()),
+					},
+					TaskName:   "每天05:30检测管理端证书（本地证书自动续期）",
+					TaskUnit:   enums.TASK_DAY,
+					TaskValue:  1,
+					TaskAt:     "05:30",
+					TaskMethod: enums.TASK_MANAGER_CERT_CHECK,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return fmt.Errorf("创建管理端证书检测任务失败: %w", err)
+				}
+				zlog.Info("管理端证书检测任务创建成功")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202608250001: 删除管理端证书检测任务")
+				return tx.Where("task_method = ?", enums.TASK_MANAGER_CERT_CHECK).Delete(&model.Task{}).Error
+			},
+		},
+	})
+
+	// 执行迁移
+	if err := m.Migrate(); err != nil {
+		errMsg := fmt.Sprintf("任务初始化迁移失败: %v", err)
+		zlog.Error("任务迁移执行错误", "error", err.Error())
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	zlog.Info("任务初始化迁移成功完成")
+	return nil
+}

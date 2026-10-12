@@ -1,0 +1,509 @@
+package waf_service
+
+import (
+	"SamWaf/common/uuid"
+	"SamWaf/customtype"
+	"SamWaf/firewall"
+	"SamWaf/global"
+	"SamWaf/model"
+	"SamWaf/model/baseorm"
+	"SamWaf/model/request"
+	"SamWaf/wafdb/dialect"
+	"errors"
+	"fmt"
+	"time"
+)
+
+type WafFirewallIPBlockService struct {
+	fw firewall.FireWallEngine
+}
+
+var WafFirewallIPBlockServiceApp = new(WafFirewallIPBlockService)
+
+// CheckFirewallAvailable 检测当前运行环境是否具备系统防火墙封禁能力
+// 返回 nil 表示可用，否则返回可直接展示给用户的原因
+func (receiver *WafFirewallIPBlockService) CheckFirewallAvailable() error {
+	return receiver.fw.CheckAvailable()
+}
+
+// SupportsIPSet 报告当前环境是否可用"大列表批量封禁"(Linux ipset / Windows 分片规则 / macOS pf table)。
+// 供威胁情报订阅"系统层落地"判定是否可下发大列表。
+func (receiver *WafFirewallIPBlockService) SupportsIPSet() bool {
+	return receiver.fw.SupportsIPSet()
+}
+
+// RecommendBlockLayer 根据站点 IP 模式与系统防火墙可用性，推荐"加黑名单"的封禁层级(供前端下拉预选)。
+//   - 代理模式站点：系统防火墙只能看到上游代理IP，封真实客户端无效 → 推荐 WAF 应用层
+//   - 直连站点且防火墙可用：内核层 DROP 更省资源 → 推荐系统层
+//   - 直连但防火墙不可用：回退 WAF 应用层
+func (receiver *WafFirewallIPBlockService) RecommendBlockLayer(hostCode string) (layer string, reason string) {
+	var host model.Hosts
+	global.GWAF_LOCAL_DB.Where("code = ?", hostCode).First(&host)
+	if host.IPMode == "proxy" {
+		return "waf", "该站点为代理模式，系统防火墙只能看到上游代理IP，封真实客户端无效，建议在WAF应用层封禁"
+	}
+	if err := receiver.fw.CheckAvailable(); err == nil {
+		return "system", "该站点直连客户端，系统防火墙内核层DROP性能更优"
+	} else {
+		return "waf", "当前环境无系统防火墙能力(" + err.Error() + ")，回退WAF应用层封禁"
+	}
+}
+
+// AddApi 添加防火墙IP封禁（自动调用系统防火墙）
+func (receiver *WafFirewallIPBlockService) AddApi(req request.WafFirewallIPBlockAddReq) error {
+	// 1. 环境不具备防火墙能力时直接给出明确原因，不要把底层命令错误抛给用户
+	if err := receiver.fw.CheckAvailable(); err != nil {
+		return err
+	}
+
+	// 2. 检查IP是否已存在
+	var existBean model.FirewallIPBlock
+	err := global.GWAF_LOCAL_DB.Where("ip = ? AND "+dialect.Q("status")+" = ?", req.IP, "active").First(&existBean).Error
+	if err == nil && existBean.Id != "" {
+		return errors.New("该IP已经被封禁")
+	}
+
+	// 3. 调用防火墙封禁IP
+	err = receiver.fw.BlockIP(req.IP, req.Reason)
+	if err != nil {
+		return fmt.Errorf("防火墙封禁失败: %v", err)
+	}
+
+	// 4. 保存到数据库
+	var bean = &model.FirewallIPBlock{
+		BaseOrm: baseorm.BaseOrm{
+			Id:          uuid.GenUUID(),
+			USER_CODE:   global.GWAF_USER_CODE,
+			Tenant_ID:   global.GWAF_TENANT_ID,
+			CREATE_TIME: customtype.JsonTime(time.Now()),
+			UPDATE_TIME: customtype.JsonTime(time.Now()),
+		},
+		HostCode:   req.HostCode,
+		IP:         req.IP,
+		Reason:     req.Reason,
+		BlockType:  req.BlockType,
+		Status:     "active",
+		ExpireTime: req.ExpireTime,
+		Remarks:    req.Remarks,
+	}
+
+	// 如果没有指定封禁类型，默认为手动封禁
+	if bean.BlockType == "" {
+		bean.BlockType = "manual"
+	}
+
+	err = global.GWAF_LOCAL_DB.Create(bean).Error
+	if err != nil {
+		// 如果数据库保存失败，回滚防火墙规则
+		receiver.fw.UnblockIP(req.IP)
+		return fmt.Errorf("保存到数据库失败: %v", err)
+	}
+
+	return nil
+}
+
+// CheckIsExistApi 检查IP是否已存在
+func (receiver *WafFirewallIPBlockService) CheckIsExistApi(req request.WafFirewallIPBlockAddReq) error {
+	return global.GWAF_LOCAL_DB.First(&model.FirewallIPBlock{}, "ip = ? AND "+dialect.Q("status")+" = ?", req.IP, "active").Error
+}
+
+// ModifyApi 修改防火墙IP封禁
+func (receiver *WafFirewallIPBlockService) ModifyApi(req request.WafFirewallIPBlockEditReq) error {
+	// 1. 获取原记录
+	var oldBean model.FirewallIPBlock
+	err := global.GWAF_LOCAL_DB.Where("id = ?", req.Id).First(&oldBean).Error
+	if err != nil {
+		return errors.New("记录不存在")
+	}
+
+	// 2. 探测防火墙能力：只有需要新增封禁规则时才强制要求防火墙可用，
+	//    其余情况（改备注、改到期时间、解除封禁）即使防火墙不可用也允许改数据库
+	fwErr := receiver.fw.CheckAvailable()
+	needBlock := oldBean.IP != req.IP || (oldBean.Status != req.Status && req.Status == "active")
+	if fwErr != nil && needBlock {
+		return fwErr
+	}
+
+	// 3. 如果IP地址改变了，需要更新防火墙规则
+	if oldBean.IP != req.IP && fwErr == nil {
+		// 删除旧的防火墙规则
+		if oldBean.Status == "active" {
+			receiver.fw.UnblockIP(oldBean.IP)
+		}
+
+		// 添加新的防火墙规则
+		err = receiver.fw.BlockIP(req.IP, req.Reason)
+		if err != nil {
+			// 如果新规则添加失败，恢复旧规则
+			if oldBean.Status == "active" {
+				receiver.fw.BlockIP(oldBean.IP, oldBean.Reason)
+			}
+			return fmt.Errorf("更新防火墙规则失败: %v", err)
+		}
+	}
+
+	// 4. 更新数据库
+	beanMap := map[string]interface{}{
+		"HostCode":    req.HostCode,
+		"IP":          req.IP,
+		"Reason":      req.Reason,
+		"BlockType":   req.BlockType,
+		"Status":      req.Status,
+		"ExpireTime":  req.ExpireTime,
+		"Remarks":     req.Remarks,
+		"UPDATE_TIME": customtype.JsonTime(time.Now()),
+	}
+
+	err = global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).Where("id = ?", req.Id).Updates(beanMap).Error
+	if err != nil {
+		// 如果数据库更新失败，回滚防火墙规则
+		if oldBean.IP != req.IP && fwErr == nil {
+			receiver.fw.UnblockIP(req.IP)
+			if oldBean.Status == "active" {
+				receiver.fw.BlockIP(oldBean.IP, oldBean.Reason)
+			}
+		}
+		return fmt.Errorf("更新数据库失败: %v", err)
+	}
+
+	// 5. 如果状态改变，更新防火墙（防火墙不可用时只改数据库状态）
+	if oldBean.Status != req.Status && fwErr == nil {
+		if req.Status == "active" {
+			receiver.fw.BlockIP(req.IP, req.Reason)
+		} else {
+			receiver.fw.UnblockIP(req.IP)
+		}
+	}
+
+	return nil
+}
+
+// GetDetailApi 获取防火墙IP封禁详情
+func (receiver *WafFirewallIPBlockService) GetDetailApi(req request.WafFirewallIPBlockDetailReq) model.FirewallIPBlock {
+	var bean model.FirewallIPBlock
+	global.GWAF_LOCAL_DB.Where("id=?", req.Id).Find(&bean)
+	return bean
+}
+
+// GetDetailByIdApi 根据ID获取详情
+func (receiver *WafFirewallIPBlockService) GetDetailByIdApi(id string) model.FirewallIPBlock {
+	var bean model.FirewallIPBlock
+	global.GWAF_LOCAL_DB.Where("id=?", id).Find(&bean)
+	return bean
+}
+
+// GetListApi 获取防火墙IP封禁列表
+func (receiver *WafFirewallIPBlockService) GetListApi(req request.WafFirewallIPBlockSearchReq) ([]model.FirewallIPBlock, int64, error) {
+	var list []model.FirewallIPBlock
+	var total int64 = 0
+
+	// 构建查询条件
+	query := global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{})
+
+	if len(req.HostCode) > 0 {
+		query = query.Where("host_code = ?", req.HostCode)
+	}
+	if len(req.IP) > 0 {
+		query = query.Where("ip LIKE ?", "%"+req.IP+"%")
+	}
+	if len(req.Reason) > 0 {
+		query = query.Where("reason LIKE ?", "%"+req.Reason+"%")
+	}
+	if len(req.BlockType) > 0 {
+		query = query.Where("block_type = ?", req.BlockType)
+	}
+	if len(req.Status) > 0 {
+		query = query.Where(dialect.Q("status")+" = ?", req.Status)
+	}
+
+	// 统计总数
+	query.Count(&total)
+
+	// 分页查询
+	err := query.Order("create_time DESC").
+		Limit(req.PageSize).
+		Offset(req.PageSize * (req.PageIndex - 1)).
+		Find(&list).Error
+
+	return list, total, err
+}
+
+// DelApi 删除防火墙IP封禁（同时删除系统防火墙规则）
+func (receiver *WafFirewallIPBlockService) DelApi(req request.WafFirewallIPBlockDelReq) error {
+	// 1. 获取记录
+	var bean model.FirewallIPBlock
+	err := global.GWAF_LOCAL_DB.Where("id = ?", req.Id).First(&bean).Error
+	if err != nil {
+		return errors.New("记录不存在")
+	}
+
+	// 2. 删除防火墙规则（防火墙不可用时跳过，避免记录永远删不掉）
+	if bean.Status == "active" && receiver.fw.CheckAvailable() == nil {
+		err = receiver.fw.UnblockIP(bean.IP)
+		if err != nil {
+			return fmt.Errorf("删除防火墙规则失败: %v", err)
+		}
+	}
+
+	// 3. 删除数据库记录
+	err = global.GWAF_LOCAL_DB.Where("id = ?", req.Id).Delete(&model.FirewallIPBlock{}).Error
+	return err
+}
+
+// BatchDelApi 批量删除防火墙IP封禁
+func (receiver *WafFirewallIPBlockService) BatchDelApi(req request.WafFirewallIPBlockBatchDelReq) error {
+	if len(req.Ids) == 0 {
+		return errors.New("删除ID列表不能为空")
+	}
+
+	// 1. 获取所有要删除的记录
+	var beans []model.FirewallIPBlock
+	err := global.GWAF_LOCAL_DB.Where("id IN ?", req.Ids).Find(&beans).Error
+	if err != nil {
+		return err
+	}
+
+	// 2. 批量删除防火墙规则（防火墙不可用时跳过，只清理数据库记录）
+	var ipsToUnblock []string
+	if receiver.fw.CheckAvailable() == nil {
+		for _, bean := range beans {
+			if bean.Status == "active" {
+				ipsToUnblock = append(ipsToUnblock, bean.IP)
+			}
+		}
+	}
+
+	if len(ipsToUnblock) > 0 {
+		successCount, failedIPs, _ := receiver.fw.UnblockIPList(ipsToUnblock)
+		if len(failedIPs) > 0 {
+			return fmt.Errorf("部分IP解除封禁失败，成功%d个，失败%d个", successCount, len(failedIPs))
+		}
+	}
+
+	// 3. 批量删除数据库记录
+	err = global.GWAF_LOCAL_DB.Where("id IN ?", req.Ids).Delete(&model.FirewallIPBlock{}).Error
+	return err
+}
+
+// BatchAddApi 批量添加防火墙IP封禁
+func (receiver *WafFirewallIPBlockService) BatchAddApi(req request.WafFirewallIPBlockBatchAddReq) (successCount int, failedIPs []string, err error) {
+	if len(req.IPs) == 0 {
+		return 0, nil, errors.New("IP列表不能为空")
+	}
+
+	// 环境不具备防火墙能力时直接整体失败，避免逐个IP重复报错
+	if fwErr := receiver.fw.CheckAvailable(); fwErr != nil {
+		return 0, req.IPs, fwErr
+	}
+
+	successCount = 0
+	failedIPs = []string{}
+
+	for _, ip := range req.IPs {
+		addReq := request.WafFirewallIPBlockAddReq{
+			HostCode:  req.HostCode,
+			IP:        ip,
+			Reason:    req.Reason,
+			BlockType: req.BlockType,
+			Remarks:   req.Remarks,
+		}
+
+		err := receiver.AddApi(addReq)
+		if err != nil {
+			failedIPs = append(failedIPs, ip)
+		} else {
+			successCount++
+		}
+	}
+
+	if len(failedIPs) > 0 {
+		return successCount, failedIPs, fmt.Errorf("部分IP封禁失败")
+	}
+
+	return successCount, failedIPs, nil
+}
+
+// EnableApi 启用防火墙IP封禁
+func (receiver *WafFirewallIPBlockService) EnableApi(req request.WafFirewallIPBlockEnableReq) error {
+	// 0. 环境不具备防火墙能力时直接给出明确原因
+	if err := receiver.fw.CheckAvailable(); err != nil {
+		return err
+	}
+
+	// 1. 获取记录
+	var bean model.FirewallIPBlock
+	err := global.GWAF_LOCAL_DB.Where("id = ?", req.Id).First(&bean).Error
+	if err != nil {
+		return errors.New("记录不存在")
+	}
+
+	if bean.Status == "active" {
+		return errors.New("该IP已经处于封禁状态")
+	}
+
+	// 2. 添加防火墙规则
+	err = receiver.fw.BlockIP(bean.IP, bean.Reason)
+	if err != nil {
+		return fmt.Errorf("启用防火墙规则失败: %v", err)
+	}
+
+	// 3. 更新数据库状态
+	err = global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).
+		Where("id = ?", req.Id).
+		Updates(map[string]interface{}{
+			"Status":      "active",
+			"UPDATE_TIME": customtype.JsonTime(time.Now()),
+		}).Error
+
+	return err
+}
+
+// DisableApi 禁用防火墙IP封禁
+func (receiver *WafFirewallIPBlockService) DisableApi(req request.WafFirewallIPBlockDisableReq) error {
+	// 1. 获取记录
+	var bean model.FirewallIPBlock
+	err := global.GWAF_LOCAL_DB.Where("id = ?", req.Id).First(&bean).Error
+	if err != nil {
+		return errors.New("记录不存在")
+	}
+
+	if bean.Status == "inactive" {
+		return errors.New("该IP已经处于未封禁状态")
+	}
+
+	// 2. 删除防火墙规则（防火墙不可用时跳过，只更新数据库状态）
+	if receiver.fw.CheckAvailable() == nil {
+		err = receiver.fw.UnblockIP(bean.IP)
+		if err != nil {
+			return fmt.Errorf("禁用防火墙规则失败: %v", err)
+		}
+	}
+
+	// 3. 更新数据库状态
+	err = global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).
+		Where("id = ?", req.Id).
+		Updates(map[string]interface{}{
+			"Status":      "inactive",
+			"UPDATE_TIME": customtype.JsonTime(time.Now()),
+		}).Error
+
+	return err
+}
+
+// SyncFirewallRules 同步防火墙规则（从数据库恢复到系统防火墙）
+func (receiver *WafFirewallIPBlockService) SyncFirewallRules(hostCode string) (successCount int, failedCount int, err error) {
+	// 0. 环境不具备防火墙能力时直接给出明确原因
+	if fwErr := receiver.fw.CheckAvailable(); fwErr != nil {
+		return 0, 0, fwErr
+	}
+
+	// 1. 获取所有active状态的记录
+	var beans []model.FirewallIPBlock
+	query := global.GWAF_LOCAL_DB.Where(dialect.Q("status")+" = ?", "active")
+
+	if hostCode != "" {
+		query = query.Where("host_code = ?", hostCode)
+	}
+
+	err = query.Find(&beans).Error
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// 2. 批量添加到防火墙
+	var ips []string
+	for _, bean := range beans {
+		ips = append(ips, bean.IP)
+	}
+
+	if len(ips) > 0 {
+		successCount, failedIPs, _ := receiver.fw.BlockIPList(ips)
+		failedCount = len(failedIPs)
+		return successCount, failedCount, nil
+	}
+
+	return 0, 0, nil
+}
+
+// ClearExpiredRules 清理过期的封禁规则：撤销系统防火墙规则并【删除】数据库记录。
+// 说明：过期记录(expire_time>0 且已过期)无论当前是 active 还是 inactive 都会被清掉；
+// 以前只是把状态置为 inactive，导致过期记录长期堆积在库里、再次点“清理过期”也不消失，
+// 用户期望“清理”即彻底删除，故改为硬删除(与手工删除一致)。永久封禁(expire_time=0)不受影响。
+func (receiver *WafFirewallIPBlockService) ClearExpiredRules() (int, error) {
+	// 1. 查找所有过期的记录（ExpireTime > 0 且 < 当前时间，任意状态）
+	// 只取清理循环需要的列(id/ip/status)，避免把 reason/remarks 等大字段一并读出加重 IO；
+	// 命中 (status, expire_time) 复合索引后该查询应为毫秒级。
+	currentTime := time.Now().Unix()
+	var beans []model.FirewallIPBlock
+	err := global.GWAF_LOCAL_DB.Select("id", "ip", dialect.Q("status")).
+		Where("expire_time > 0 AND expire_time < ?", currentTime).
+		Find(&beans).Error
+	if err != nil {
+		return 0, err
+	}
+
+	// 2. 防火墙不可用时（如容器内没有 iptables），跳过防火墙操作，只删数据库记录
+	fwAvailable := receiver.fw.CheckAvailable() == nil
+
+	count := 0
+	idsToDelete := make([]string, 0, len(beans))
+	for _, bean := range beans {
+		// 仍处于封禁(active)的过期记录先撤系统防火墙规则；撤不掉则跳过删除，避免留下孤儿规则
+		if bean.Status == "active" && fwAvailable {
+			if err := receiver.fw.UnblockIP(bean.IP); err != nil {
+				continue
+			}
+		}
+		idsToDelete = append(idsToDelete, bean.Id)
+		count++
+	}
+
+	// 3. 批量硬删除过期记录
+	if len(idsToDelete) > 0 {
+		if err := global.GWAF_LOCAL_DB.Where("id IN ?", idsToDelete).
+			Delete(&model.FirewallIPBlock{}).Error; err != nil {
+			return 0, err
+		}
+	}
+
+	return count, nil
+}
+
+// GetHostCodesByIds 根据ID列表获取对应的HostCode列表
+func (receiver *WafFirewallIPBlockService) GetHostCodesByIds(ids []string) ([]string, error) {
+	var hostCodes []string
+	err := global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).
+		Where("id IN ?", ids).
+		Distinct("host_code").
+		Pluck("host_code", &hostCodes).Error
+	return hostCodes, err
+}
+
+// GetAllActiveIPs 获取所有active状态的IP列表
+func (receiver *WafFirewallIPBlockService) GetAllActiveIPs() ([]string, error) {
+	var ips []string
+	err := global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).
+		Where(dialect.Q("status")+" = ?", "active").
+		Pluck("ip", &ips).Error
+	return ips, err
+}
+
+// GetStatistics 获取统计信息
+func (receiver *WafFirewallIPBlockService) GetStatistics() map[string]interface{} {
+	var total, active, inactive, expired int64
+
+	global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).Count(&total)
+	global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).Where(dialect.Q("status")+" = ?", "active").Count(&active)
+	global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).Where(dialect.Q("status")+" = ?", "inactive").Count(&inactive)
+
+	currentTime := time.Now().Unix()
+	global.GWAF_LOCAL_DB.Model(&model.FirewallIPBlock{}).
+		Where("expire_time > 0 AND expire_time < ?", currentTime).Count(&expired)
+
+	return map[string]interface{}{
+		"total":    total,
+		"active":   active,
+		"inactive": inactive,
+		"expired":  expired,
+	}
+}

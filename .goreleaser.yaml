@@ -1,0 +1,175 @@
+# This is an example .goreleaser.yml file with some sensible defaults.
+# Make sure to check the documentation at https://goreleaser.com
+
+# The lines below are called `modelines`. See `:help modeline`
+# Feel free to remove those if you don't want/need to use them.
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+version: 2
+
+before:
+  hooks:
+    # 只下载依赖，不用 go mod tidy：发版途中改写 go.mod/go.sum 会让产物不可复现
+    - go mod download
+    # 注意：本仓库没有任何 go:generate 指令，故不跑 go generate（跑了也只是空转一遍全模块加载）
+    # pull samwaf web（版本来源见 public/web_frontend.conf，由脚本解析并写版本戳）
+    - bash .github/scripts/fetch_web_dist.sh
+builds:
+  # 正式发布版本 (Release builds)
+  - id: "samwaf_linux"
+    binary: "SamWafLinux64"
+    main: ./cmd/samwaf
+    env:
+      - CGO_ENABLED=1
+      - CC=x86_64-linux-musl-gcc
+      - CXX=x86_64-linux-musl-g++
+      - CGO_CFLAGS=-Wno-unused-variable -D_LARGEFILE64_SOURCE
+      - GOAMD64=v1
+    goos:
+      - linux
+    goarch:
+      - amd64
+    ldflags:
+      - -X SamWaf/global.GWAF_RELEASE=true
+      - -X SamWaf/global.GWAF_RUNTIME_WIN7_VERSION=false
+      - -X SamWaf/global.GWAF_RELEASE_VERSION_NAME={{ time "20060102" }}
+      - -X SamWaf/global.GWAF_RELEASE_VERSION={{.Tag}}
+      - -s -w
+      - -extldflags "-static"
+  - id: "samwaf_win"
+    binary: "SamWaf64"
+    main: ./cmd/samwaf
+    env:
+      - CGO_ENABLED=1
+      - CC=x86_64-w64-mingw32-gcc
+      - CXX=x86_64-w64-mingw32-g++
+      - CGO_CFLAGS=-Wno-unused-variable
+    goos:
+      - windows
+    goarch:
+      - amd64
+    ldflags:
+      - -X SamWaf/global.GWAF_RELEASE=true
+      - -X SamWaf/global.GWAF_RUNTIME_WIN7_VERSION=false
+      - -X SamWaf/global.GWAF_RELEASE_VERSION_NAME={{ time "20060102" }}
+      - -X SamWaf/global.GWAF_RELEASE_VERSION={{.Tag}}
+      - -s -w
+      - -extldflags "-static"
+  - id: "samwaf_linux_arm64"
+    binary: "SamWafLinuxArm64"
+    main: ./cmd/samwaf
+    env:
+      - CGO_ENABLED=1
+      - CC=aarch64-linux-gnu-gcc
+      - CXX=aarch64-linux-gnu-g++
+      - CGO_CFLAGS=-Wno-unused-variable
+    goos:
+      - linux
+    goarch:
+      - arm64
+    ldflags:
+      - -X SamWaf/global.GWAF_RELEASE=true
+      - -X SamWaf/global.GWAF_RUNTIME_WIN7_VERSION=false
+      - -X SamWaf/global.GWAF_RELEASE_VERSION_NAME={{ time "20060102" }}
+      - -X SamWaf/global.GWAF_RELEASE_VERSION={{.Tag}}
+      - -s -w
+      - -extldflags "-static"
+upx:
+  - # Whether to enable it or not.
+    #
+    # Templates: allowed.
+    enabled: false
+
+    # Filter by build ID.
+    ids: [samwaf_linux,samwaf_win]
+
+    # Compress argument.
+    # Valid options are from '1' (faster) to '9' (better), and 'best'.
+    compress: best
+
+archives:
+  - id: "release_archives"
+    builds: ["samwaf_linux", "samwaf_win", "samwaf_linux_arm64"]
+    format: tar.gz
+    # this name template makes the OS and Arch compatible with the results of `uname`.
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+      {{.Tag}}
+    # use zip for windows archives
+    format_overrides:
+      - goos: windows
+        format: zip
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "Bug fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  # If you want to manually examine the release before its live, uncomment this line:
+  # draft: true
+  # Whether to remove existing draft releases with the same name before creating a new one.
+  # Only effective if `draft` is set to true.
+  # Default: false.
+  replace_existing_draft: true
+  # Useful if you want to delay the creation of the tag in the remote.
+  # You can create the tag locally, but not push it, and run GoReleaser.
+  # It'll then set the `target_commitish` portion of the GitHub release to the value of this field.
+  # Only works on GitHub.
+  #
+  # Default: ''
+  target_commitish: "{{ .Commit }}"
+  # If set to auto, will mark the release as not ready for production in case there is an indicator for this in the tag e.g. v1.0.0-rc1 .
+  # If set to true, will mark the release as not ready for production.
+  # Default is false.
+  prerelease: false
+  # What to do with the release notes in case there the release already exists.
+  #
+  # Valid options are:
+  # - `keep-existing`: keep the existing notes
+  # - `append`: append the current release notes to the existing notes
+  # - `prepend`: prepend the current release notes to the existing notes
+  # - `replace`: replace existing notes
+  #
+  # Default is `keep-existing`.
+  mode: append
+  # Header for the release body.
+  #
+  # Templates: allowed
+  header: |
+    ## SamWaf Release {{.Tag}} ({{ .Date }})
+    
+  # Footer for the release body.
+  #
+  # Templates: allowed
+  footer: |
+    ---
+    
+    ### 📋 版本说明
+    - **正式版本**：推荐用户生产环境使用，经过优化，文件较小
+    - **测试版本（Beta）**：功能尝鲜,修正部分bug等 
+    
+    ### 🆘 技术支持
+    如遇到问题需要技术支持，请：
+    1. 优先使用正式版本，测试版本
+    2. 提供详细的错误信息和日志
+
+    ### 📮 联系方式
+    - **微信公众号**：SamWaf开源防火墙
+    - **邮箱**：samwafgo@gmail.com

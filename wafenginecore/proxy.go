@@ -1,0 +1,616 @@
+package wafenginecore
+
+import (
+	"SamWaf/common/zlog"
+	"SamWaf/global"
+	"SamWaf/innerbean"
+	"SamWaf/model"
+	"SamWaf/model/wafenginmodel"
+	"SamWaf/wafproxy"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func (waf *WafEngine) ProxyHTTP(w http.ResponseWriter, r *http.Request, host string, remoteUrl *url.URL, clientIp string, ctx context.Context, weblog *innerbean.WebLog, hostTarget *wafenginmodel.HostSafe) {
+
+	// 在 director 修改请求头之前，将客户端原始 Accept-Encoding 存入 context，
+	// 供响应压缩逻辑使用（自定义头可能把转发请求的 Accept-Encoding 清空）
+	ctx = context.WithValue(ctx, "original_accept_encoding", r.Header.Get("Accept-Encoding"))
+
+	//检测是否启动负载
+	if hostTarget.Host.IsEnableLoadBalance > 0 {
+		// 这把锁只保护"惰性建代理 + 选后端"这段共享状态的读写，
+		// 绝不能罩住 proxy.ServeHTTP —— 那样锁的持有时长就等于整个响应时长，
+		// 一条 SSE/大文件/WebSocket 长连接会把该站点所有请求排队堵死
+		// （现场表现：大模型还在流式输出，同站点其他页面全打不开）。
+		proxy, ok := waf.pickLoadBalanceProxy(w, r, host, remoteUrl, clientIp, weblog, hostTarget)
+		if !ok {
+			return
+		}
+
+		// 添加转发耗时记录
+		if wafCtx, ok := ctx.Value("waf_context").(innerbean.WafHttpContextData); ok && wafCtx.Weblog != nil {
+			forwardStart := time.Now().UnixNano() / 1e6
+			defer func() {
+				wafCtx.Weblog.ForwardCost = time.Now().UnixNano()/1e6 - forwardStart
+				wafCtx.Weblog.IsBalance = 1
+			}()
+		}
+		proxy.ServeHTTP(w, r.WithContext(ctx))
+	} else {
+		transport := waf.getOrCreateTransport(r, host, 0, model.LoadBalance{}, hostTarget, remoteUrl.Scheme) // 使用缓存的Transport
+		customHeaders := waf.getCustomHeaders(r, host, 0, model.LoadBalance{}, hostTarget)
+		customConfig := map[string]string{}
+		customConfig["IsTransBackDomain"] = strconv.Itoa(hostTarget.Host.IsTransBackDomain)
+		proxy := wafproxy.NewSingleHostReverseProxyCustomHeader(remoteUrl, customHeaders, customConfig)
+		waf.applyResponseBuffering(proxy, hostTarget)
+		proxy.Transport = transport
+		proxy.ModifyResponse = waf.modifyResponse()
+		proxy.ErrorHandler = waf.errorResponse()
+
+		// 添加转发耗时记录
+		if wafCtx, ok := ctx.Value("waf_context").(innerbean.WafHttpContextData); ok && wafCtx.Weblog != nil {
+			forwardStart := time.Now().UnixNano() / 1e6
+			defer func() {
+				wafCtx.Weblog.ForwardCost = time.Now().UnixNano()/1e6 - forwardStart
+				wafCtx.Weblog.IsBalance = 0
+			}()
+		}
+
+		proxy.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+// pickLoadBalanceProxy 在负载运行时锁内完成"惰性建代理 + 按策略选后端"，
+// 返回后立即释放锁，转发过程不再持锁。ok=false 表示已经向客户端写过错误响应。
+func (waf *WafEngine) pickLoadBalanceProxy(w http.ResponseWriter, r *http.Request, host string,
+	remoteUrl *url.URL, clientIp string, weblog *innerbean.WebLog,
+	hostTarget *wafenginmodel.HostSafe) (*wafproxy.ReverseProxy, bool) {
+
+	lb := hostTarget.LoadBalanceRuntime
+	lb.Mux.Lock()
+	defer lb.Mux.Unlock()
+
+	if len(hostTarget.LoadBalanceLists) > 0 && len(hostTarget.LoadBalanceRuntime.RevProxies) == 0 {
+		for addrIndex, loadBalance := range hostTarget.LoadBalanceLists {
+			//初始化后端负载
+			zlog.Debug("HTTP REQUEST", weblog.REQ_UUID, weblog.URL, "未初始化")
+			transport := waf.getOrCreateTransport(r, host, 1, loadBalance, hostTarget, remoteUrl.Scheme) // 使用缓存的Transport
+			customHeaders := waf.getCustomHeaders(r, host, 1, loadBalance, hostTarget)
+			customConfig := map[string]string{}
+			customConfig["IsTransBackDomain"] = strconv.Itoa(hostTarget.Host.IsTransBackDomain)
+			proxy := wafproxy.NewSingleHostReverseProxyCustomHeader(remoteUrl, customHeaders, customConfig)
+			waf.applyResponseBuffering(proxy, hostTarget)
+			proxy.Transport = transport
+			proxy.ModifyResponse = waf.modifyResponse()
+			proxy.ErrorHandler = waf.errorResponse()
+			hostTarget.LoadBalanceRuntime.RevProxies = append(hostTarget.LoadBalanceRuntime.RevProxies, proxy)
+
+			// 初始化策略相关信息
+			switch hostTarget.Host.LoadBalanceStage {
+			case 1: // 加权轮询（WRR）
+				hostTarget.LoadBalanceRuntime.WeightRoundRobinBalance.Add(addrIndex, loadBalance.Weight)
+				break
+			case 2: // IPHash
+				hostTarget.LoadBalanceRuntime.IpHashBalance.Add(strconv.Itoa(addrIndex), 1)
+				break
+			default:
+				http.Error(w, "Invalid Load Balance Stage", http.StatusBadRequest)
+			}
+		}
+	}
+	proxyIndex := waf.getProxyIndex(host, clientIp, hostTarget)
+	if proxyIndex == -1 {
+		http.Error(w, "No Available BackServer", http.StatusBadRequest)
+		return nil, false
+	}
+
+	// 记录使用的负载均衡IP和端口信息
+	if proxyIndex >= 0 && proxyIndex < len(hostTarget.LoadBalanceLists) {
+		selectedLoadBalance := hostTarget.LoadBalanceLists[proxyIndex]
+		balanceInfo := fmt.Sprintf("%s:%d", selectedLoadBalance.Remote_ip, selectedLoadBalance.Remote_port)
+
+		// 记录到WebLog的BalanceInfo字段
+		weblog.BalanceInfo = balanceInfo
+	}
+
+	// 越界保护：策略给出的下标不一定落在已建好的代理列表里（后端列表刚变更时尤其如此），
+	// 直接索引会 panic 掉整个请求
+	if proxyIndex < 0 || proxyIndex >= len(hostTarget.LoadBalanceRuntime.RevProxies) {
+		http.Error(w, "No Available Server", http.StatusBadRequest)
+		return nil, false
+	}
+
+	proxy := hostTarget.LoadBalanceRuntime.RevProxies[proxyIndex]
+	if proxy == nil {
+		http.Error(w, "No Available Server", http.StatusBadRequest)
+		return nil, false
+	}
+	return proxy, true
+}
+
+// ProxyHTTPWithPathRule 根据路径规则将请求代理到指定后端
+func (waf *WafEngine) ProxyHTTPWithPathRule(w http.ResponseWriter, r *http.Request, host string, rule *model.HostPathRule, clientIP string, ctx context.Context, weblog *innerbean.WebLog, hostTarget *wafenginmodel.HostSafe) {
+	ctx = context.WithValue(ctx, "original_accept_encoding", r.Header.Get("Accept-Encoding"))
+
+	// 构建后端 URL（后端协议可显式选择，修复 #857：与客户端协议解耦）
+	scheme := resolvePathRuleScheme(r, rule)
+	targetStr := scheme + "://" + rule.RemoteHost
+	if rule.RemotePort > 0 {
+		targetStr += ":" + strconv.Itoa(rule.RemotePort)
+	}
+	remoteUrl, err := url.Parse(targetStr)
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	// 请求访问记录（默认关闭）：打开后把命中该规则的转发请求记入程序日志，便于判断请求是否到达代理/后端
+	if rule.RecordAccessLog == 1 {
+		zlog.Info(fmt.Sprintf("[路径规则访问记录] 转发开始 规则=%s 客户端=%s%s 目标=%s",
+			rule.RuleName, r.Host, r.URL.RequestURI(), remoteUrl.String()),
+			weblog.REQ_UUID)
+	}
+
+	// 若需要剥离前缀，克隆请求并修改 URL
+	if rule.StripPrefix == 1 && strings.HasPrefix(r.URL.Path, rule.Path) {
+		newR := r.Clone(ctx)
+		stripped := strings.TrimPrefix(r.URL.Path, rule.Path)
+		if !strings.HasPrefix(stripped, "/") {
+			stripped = "/" + stripped
+		}
+		newR.URL.Path = stripped
+		if r.URL.RawPath != "" {
+			rawStripped := strings.TrimPrefix(r.URL.RawPath, rule.Path)
+			if !strings.HasPrefix(rawStripped, "/") {
+				rawStripped = "/" + rawStripped
+			}
+			newR.URL.RawPath = rawStripped
+		}
+		r = newR
+	}
+
+	transport := waf.createPathRuleTransport(r, rule, hostTarget)
+	customHeaders := map[string]string{}
+	if r.TLS != nil {
+		customHeaders["X-FORWARDED-PROTO"] = "https"
+	}
+	customConfig := map[string]string{}
+	customConfig["IsTransBackDomain"] = strconv.Itoa(hostTarget.Host.IsTransBackDomain)
+
+	proxy := wafproxy.NewSingleHostReverseProxyCustomHeader(remoteUrl, customHeaders, customConfig)
+	waf.applyResponseBuffering(proxy, hostTarget)
+	proxy.Transport = transport
+	proxy.ModifyResponse = waf.modifyResponse()
+	proxy.ErrorHandler = waf.errorResponse()
+
+	if wafCtx, ok := ctx.Value("waf_context").(innerbean.WafHttpContextData); ok && wafCtx.Weblog != nil {
+		forwardStart := time.Now().UnixNano() / 1e6
+		defer func() {
+			wafCtx.Weblog.ForwardCost = time.Now().UnixNano()/1e6 - forwardStart
+			wafCtx.Weblog.IsBalance = 0
+			// 转发结束记录：此时 modifyResponse/errorResponse 已回填 STATUS_CODE 与 ACTION，
+			// 据此可判断请求是否真正到达后端（到达=modifyResponse填状态码；未到=errorResponse填异常分类）
+			if rule.RecordAccessLog == 1 {
+				zlog.Info(fmt.Sprintf("[路径规则访问记录] 转发结束 规则=%s 目标=%s 状态码=%d 处理结果=%s 转发耗时=%dms",
+					rule.RuleName, remoteUrl.String(), wafCtx.Weblog.STATUS_CODE, wafCtx.Weblog.ACTION, wafCtx.Weblog.ForwardCost),
+					wafCtx.Weblog.REQ_UUID)
+			}
+		}()
+	}
+
+	proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// applyResponseBuffering 按站点配置设置反向代理响应缓冲。
+// IsEnableResponseBuffering==0 时等价于 nginx proxy_buffering off：每次写出后立即 flush，利于 SSE/流式/大文件边下边传。
+func (waf *WafEngine) applyResponseBuffering(proxy *wafproxy.ReverseProxy, hostTarget *wafenginmodel.HostSafe) {
+	if proxy == nil || hostTarget == nil {
+		return
+	}
+	if hostTarget.Host.IsEnableResponseBuffering == 0 {
+		proxy.FlushInterval = -1
+	}
+}
+
+// createPathRuleTransport 为路径规则代理创建 Transport
+func (waf *WafEngine) createPathRuleTransport(r *http.Request, rule *model.HostPathRule, hostTarget *wafenginmodel.HostSafe) *http.Transport {
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := net.Dialer{
+			Timeout:   time.Duration(global.GCONFIG_RECORD_CONNECT_TIME_OUT) * time.Second,
+			KeepAlive: time.Duration(global.GCONFIG_RECORD_KEEPALIVE_TIME_OUT) * time.Second,
+		}
+		if rule.RemoteIP != "" {
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(rule.RemoteIP, strconv.Itoa(rule.RemotePort)))
+			if err == nil {
+				return conn, nil
+			}
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+
+	// 是否以 https 连接后端由选定的后端协议决定（而非客户端 r.TLS），
+	// 这样 "HTTP 进 → HTTPS 后端" 也能正确挂载 TLS 配置并复用 InsecureSkipVerify（修复 #857）
+	var transport *http.Transport
+	if resolvePathRuleScheme(r, rule) == "https" {
+		transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: hostTarget.Host.InsecureSkipVerify == 1,
+				GetCertificate:     waf.GetCertificateFunc,
+			},
+			DialContext: dialContext,
+		}
+	} else {
+		transport = &http.Transport{
+			DialContext: dialContext,
+		}
+	}
+
+	// 响应头超时：规则可覆盖网站设置（0=继承网站，>0=用规则值；大文件/慢首字节下载可调大）。
+	// 注意：该超时只限制"等待后端响应头"，不限制响应体传输时长，故大文件下载本身不受影响。
+	respTimeout := hostTarget.Host.ResponseTimeOut
+	if rule.ResponseTimeOut > 0 {
+		respTimeout = rule.ResponseTimeOut
+	}
+	transport.ResponseHeaderTimeout = time.Duration(respTimeout) * time.Second
+	return transport
+}
+
+// resolvePathRuleScheme 计算路径规则的后端协议：显式 http/https 覆盖，否则（空/auto）跟随客户端连接协议。
+func resolvePathRuleScheme(r *http.Request, rule *model.HostPathRule) string {
+	switch strings.ToLower(rule.RemoteScheme) {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	default: // "" / "auto" 保持原有行为
+		if r.TLS != nil {
+			return "https"
+		}
+		return "http"
+	}
+}
+
+// backendScheme 为后端连接协议（remoteUrl.Scheme，如 http/https），决定是否挂 TLS 配置；
+// 不再用客户端连接协议 r.TLS 判断，从而让 "HTTP 进 → HTTPS 后端" 也能复用 InsecureSkipVerify（对齐 createPathRuleTransport / #857）
+func (waf *WafEngine) createTransport(r *http.Request, host string, isEnableLoadBalance int, loadBalance model.LoadBalance, hostTarget *wafenginmodel.HostSafe, backendScheme string) (*http.Transport, map[string]string) {
+	customHeaders := map[string]string{}
+	var transport *http.Transport
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := net.Dialer{
+			Timeout:   time.Duration(global.GCONFIG_RECORD_CONNECT_TIME_OUT) * time.Second,
+			KeepAlive: time.Duration(global.GCONFIG_RECORD_KEEPALIVE_TIME_OUT) * time.Second,
+		}
+		if isEnableLoadBalance > 0 {
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(loadBalance.Remote_ip, strconv.Itoa(loadBalance.Remote_port)))
+			if err == nil {
+				return conn, nil
+			}
+		} else {
+			if hostTarget.Host.Remote_ip != "" {
+				conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(hostTarget.Host.Remote_ip, strconv.Itoa(hostTarget.Host.Remote_port)))
+				if err == nil {
+					return conn, nil
+				}
+			}
+		}
+
+		return dialer.DialContext(ctx, network, addr)
+	}
+
+	// 增加https标识：仍按“客户端进来的协议”设置，反映客户端真实协议
+	if r.TLS != nil {
+		customHeaders["X-FORWARDED-PROTO"] = "https"
+	}
+	// 是否挂后端 TLS 配置：按“后端协议”判断（而非 r.TLS），
+	// 这样 "HTTP 进 → HTTPS 后端" 也能正确挂载 TLS 配置并复用 InsecureSkipVerify
+	if strings.EqualFold(backendScheme, "https") {
+		transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: hostTarget.Host.InsecureSkipVerify == 1,
+				GetCertificate:     waf.GetCertificateFunc,
+			},
+			DialContext: dialContext,
+		}
+	} else {
+		transport = &http.Transport{
+			DialContext: dialContext,
+		}
+	}
+
+	// 解析并应用Transport配置
+	transportConfig := model.ParseTransportConfig(hostTarget.Host.TransportJSON)
+
+	// 应用Transport配置；未配置项给兜底默认值，避免裸 Transport 在高并发下
+	// 每请求新建后端连接、用完即弃（空闲只留2条），造成建连/断连抖动耗尽端口
+	if transportConfig.MaxIdleConns > 0 {
+		transport.MaxIdleConns = transportConfig.MaxIdleConns
+	} else {
+		transport.MaxIdleConns = 512
+	}
+	if transportConfig.MaxIdleConnsPerHost > 0 {
+		transport.MaxIdleConnsPerHost = transportConfig.MaxIdleConnsPerHost
+	} else {
+		transport.MaxIdleConnsPerHost = 128
+	}
+	if transportConfig.MaxConnsPerHost > 0 {
+		transport.MaxConnsPerHost = transportConfig.MaxConnsPerHost
+	}
+	if transportConfig.IdleConnTimeout > 0 {
+		transport.IdleConnTimeout = time.Duration(transportConfig.IdleConnTimeout) * time.Second
+	} else {
+		transport.IdleConnTimeout = 90 * time.Second
+	}
+	if transportConfig.TLSHandshakeTimeout > 0 {
+		transport.TLSHandshakeTimeout = time.Duration(transportConfig.TLSHandshakeTimeout) * time.Second
+	}
+	if transportConfig.ExpectContinueTimeout > 0 {
+		transport.ExpectContinueTimeout = time.Duration(transportConfig.ExpectContinueTimeout) * time.Second
+	}
+
+	transport.ResponseHeaderTimeout = time.Duration(hostTarget.Host.ResponseTimeOut) * time.Second
+
+	// 若自定义头里将 Accept-Encoding 设为空值，则禁用 Transport 自动追加 gzip，
+	customHeadersConfig := model.ParseCustomHeadersConfig(hostTarget.Host.CustomHeadersJSON)
+	for _, h := range customHeadersConfig.Headers {
+		if strings.EqualFold(h.HeaderName, "Accept-Encoding") && h.HeaderValue == "" {
+			transport.DisableCompression = true
+			break
+		}
+	}
+
+	//把下面的参数一次性使用格式化实现
+	zlog.Debug(fmt.Sprintf("Transport配置信息:\nMaxIdleConns: %d\nMaxIdleConnsPerHost: %d\nMaxConnsPerHost: %d\nIdleConnTimeout: %v\nTLSHandshakeTimeout: %v\nExpectContinueTimeout: %v\nResponseHeaderTimeout: %v\nDisableKeepAlives: %v\nDisableCompression: %v",
+		transport.MaxIdleConns,
+		transport.MaxIdleConnsPerHost,
+		transport.MaxConnsPerHost,
+		transport.IdleConnTimeout,
+		transport.TLSHandshakeTimeout,
+		transport.ExpectContinueTimeout,
+		transport.ResponseHeaderTimeout,
+		transport.DisableKeepAlives,
+		transport.DisableCompression))
+	return transport, customHeaders
+}
+
+// 获取或创建Transport
+func (waf *WafEngine) getOrCreateTransport(r *http.Request, host string, isEnableLoadBalance int, loadBalance model.LoadBalance, hostTarget *wafenginmodel.HostSafe, backendScheme string) *http.Transport {
+	// 生成Transport的唯一键
+	transportKey := waf.generateTransportKey(host, isEnableLoadBalance, loadBalance, hostTarget, backendScheme)
+
+	waf.TransportMux.RLock()
+	if transport, exists := waf.TransportPool[transportKey]; exists {
+		waf.TransportMux.RUnlock()
+		return transport
+	}
+	waf.TransportMux.RUnlock()
+
+	// 创建新的Transport
+	waf.TransportMux.Lock()
+	defer waf.TransportMux.Unlock()
+
+	// 双重检查，防止并发创建
+	if transport, exists := waf.TransportPool[transportKey]; exists {
+		return transport
+	}
+
+	transport, _ := waf.createTransport(r, host, isEnableLoadBalance, loadBalance, hostTarget, backendScheme)
+
+	// 优化Transport配置
+	/*transport.MaxIdleConns = 1000
+	transport.MaxIdleConnsPerHost = 1000*/
+
+	if waf.TransportPool == nil {
+		waf.TransportPool = make(map[string]*http.Transport)
+	}
+	waf.TransportPool[transportKey] = transport
+
+	return transport
+}
+
+// 生成Transport的唯一键
+func (waf *WafEngine) generateTransportKey(host string, isEnableLoadBalance int, loadBalance model.LoadBalance, hostTarget *wafenginmodel.HostSafe, backendScheme string) string {
+
+	// key 末尾加入 backendScheme，避免不同后端协议(是否挂 TLS 配置)命中同一条缓存
+	key := fmt.Sprintf("%s_%d_%s_%d_%v_%s",
+		host,
+		isEnableLoadBalance,
+		hostTarget.Host.Remote_ip,
+		hostTarget.Host.Remote_port,
+		hostTarget.Host.InsecureSkipVerify,
+		backendScheme)
+	if isEnableLoadBalance == 1 {
+		key = fmt.Sprintf("%s_%d_%s_%d_%v_%s",
+			host,
+			isEnableLoadBalance,
+			loadBalance.Remote_ip,
+			loadBalance.Remote_port,
+			hostTarget.Host.InsecureSkipVerify,
+			backendScheme)
+	}
+	return key
+}
+
+// 分离自定义头部逻辑
+func (waf *WafEngine) getCustomHeaders(r *http.Request, host string, isEnableLoadBalance int, loadBalance model.LoadBalance, hostTarget *wafenginmodel.HostSafe) map[string]string {
+	customHeaders := map[string]string{}
+	if r.TLS != nil {
+		customHeaders["X-FORWARDED-PROTO"] = "https"
+	}
+
+	// 解析自定义头信息配置
+	customHeadersConfig := model.ParseCustomHeadersConfig(hostTarget.Host.CustomHeadersJSON)
+
+	// 如果启用了自定义头信息
+	if customHeadersConfig.IsEnableCustomHeaders == 1 {
+		// 获取客户端IP
+		clientIP := r.RemoteAddr
+		if idx := strings.LastIndex(clientIP, ":"); idx != -1 {
+			clientIP = clientIP[:idx]
+		}
+
+		// 遍历自定义头信息列表
+		for _, header := range customHeadersConfig.Headers {
+			if header.HeaderName == "" {
+				continue
+			}
+
+			// 解析并替换变量
+			headerValue := waf.parseHeaderValue(header.HeaderValue, r, clientIP)
+
+			// 添加到自定义头信息中
+			customHeaders[header.HeaderName] = headerValue
+		}
+	}
+
+	return customHeaders
+}
+
+// matchResponseHeaderRule 判断请求路径是否匹配某条响应头规则
+// MatchType: global(全部匹配) / prefix(路径前缀) / suffix(文件后缀，分号分隔) / exact(精确) / regex(正则)
+func matchResponseHeaderRule(rule model.CustomResponseHeaderRule, urlPath string) bool {
+	switch rule.MatchType {
+	case "global", "":
+		return true
+	case "prefix":
+		return strings.HasPrefix(urlPath, rule.MatchValue)
+	case "exact":
+		return urlPath == rule.MatchValue
+	case "suffix":
+		// 支持分号分隔多个后缀，如 ".mp4;.mp3;.webm"
+		ext := ""
+		if idx := strings.LastIndex(urlPath, "."); idx != -1 {
+			ext = strings.ToLower(urlPath[idx:])
+		}
+		if ext == "" {
+			return false
+		}
+		for _, s := range strings.Split(rule.MatchValue, ";") {
+			s = strings.TrimSpace(strings.ToLower(s))
+			if s != "" && ext == s {
+				return true
+			}
+		}
+		return false
+	case "regex":
+		matched, err := regexp.MatchString(rule.MatchValue, urlPath)
+		if err != nil {
+			return false
+		}
+		return matched
+	default:
+		return false
+	}
+}
+
+// applyCustomResponseHeaders 根据规则列表和请求路径，计算最终需要设置的响应头 map
+// 合并逻辑：先汇总所有 global 规则的 headers，再找第一条匹配的 location 规则按 MergeMode 合并。
+func (waf *WafEngine) applyCustomResponseHeaders(
+	rules []model.CustomResponseHeaderRule,
+	r *http.Request,
+	clientIP string,
+) map[string]string {
+	result := map[string]string{}
+
+	// 1. 收集全局规则 headers（可能有多条 global 规则）
+	for _, rule := range rules {
+		if rule.MatchType == "global" || rule.MatchType == "" {
+			for _, h := range rule.Headers {
+				if h.HeaderName == "" {
+					continue
+				}
+				result[h.HeaderName] = waf.parseHeaderValue(h.HeaderValue, r, clientIP)
+			}
+		}
+	}
+
+	// 2. 按顺序找第一条匹配的非 global 规则
+	for _, rule := range rules {
+		if rule.MatchType == "global" || rule.MatchType == "" {
+			continue
+		}
+		if !matchResponseHeaderRule(rule, r.URL.Path) {
+			continue
+		}
+		// 找到匹配规则
+		locationHeaders := map[string]string{}
+		for _, h := range rule.Headers {
+			if h.HeaderName == "" {
+				continue
+			}
+			locationHeaders[h.HeaderName] = waf.parseHeaderValue(h.HeaderValue, r, clientIP)
+		}
+		if rule.MergeMode == "override" {
+			// override：丢弃全局，仅用本规则
+			return locationHeaders
+		}
+		// merge（默认）：全局 + 本规则，同名以本规则为准
+		for k, v := range locationHeaders {
+			result[k] = v
+		}
+		return result
+	}
+
+	return result
+}
+
+// parseHeaderValue 解析头信息值中的变量
+// 支持的变量：
+// ${header:HeaderName} - 获取原始请求头
+// ${client_ip} - 获取客户端IP
+// ${remote_addr} - 获取远程地址
+// ${host} - 获取主机名
+// ${scheme} - 获取协议（http/https）
+// ${request_uri} - 获取请求URI
+// ${request_method} - 获取请求方法
+func (waf *WafEngine) parseHeaderValue(value string, r *http.Request, clientIP string) string {
+	// 正则表达式匹配 ${变量名} 或 ${header:头名称}
+	varPattern := regexp.MustCompile(`\$\{([^}]+)\}`)
+
+	result := varPattern.ReplaceAllStringFunc(value, func(match string) string {
+		// 提取变量名（去掉 ${ 和 }）
+		varName := match[2 : len(match)-1]
+
+		// 检查是否是header变量
+		if strings.HasPrefix(varName, "header:") {
+			headerName := strings.TrimPrefix(varName, "header:")
+			headerValue := r.Header.Get(headerName)
+			if headerValue == "" {
+				return "" // 如果header不存在，返回空字符串
+			}
+			return headerValue
+		}
+
+		// 处理其他内置变量
+		switch varName {
+		case "client_ip":
+			return clientIP
+		case "remote_addr":
+			return r.RemoteAddr
+		case "host":
+			return r.Host
+		case "scheme":
+			if r.TLS != nil {
+				return "https"
+			}
+			return "http"
+		case "request_uri":
+			return r.RequestURI
+		case "request_method":
+			return r.Method
+		default:
+			// 未知变量，保持原样
+			return match
+		}
+	})
+
+	return result
+}

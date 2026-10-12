@@ -1,0 +1,907 @@
+package wafupdate
+
+import (
+	"SamWaf/binarydist"
+	"SamWaf/global"
+	"SamWaf/utils"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"golang.org/x/mod/semver"
+	"io"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	// holds a timestamp which triggers the next update
+	upcktimePath = "cktime"                            // path to timestamp file relative to u.Dir
+	plat         = runtime.GOOS + "-" + runtime.GOARCH // ex: linux-amd64
+)
+
+var (
+	ErrHashMismatch = errors.New("new file hash mismatch after patch")
+
+	defaultHTTPRequester = HTTPRequester{}
+)
+
+// Updater is the configuration and runtime data for doing an update.
+//
+// Note that ApiURL, BinURL and DiffURL should have the same value if all files are available at the same location.
+//
+// Example:
+//
+//	updater := &selfupdate.Updater{
+//		CurrentVersion: version,
+//		ApiURL:         "http://updates.yourdomain.com/",
+//		BinURL:         "http://updates.yourdownmain.com/",
+//		DiffURL:        "http://updates.yourdomain.com/",
+//		Dir:            "update/",
+//		CmdName:        "myapp", // app name
+//	}
+//	if updater != nil {
+//		go updater.BackgroundRun()
+//	}
+type Updater struct {
+	CurrentVersion string    // Currently running version. `dev` is a special version here and will cause the updater to never update.
+	ApiURL         string    // Base URL for API requests (JSON files).
+	CmdName        string    // Command name is appended to the ApiURL like http://apiurl/CmdName/. This represents one binary.
+	BinURL         string    // Base URL for full binary downloads.
+	DiffURL        string    // Base URL for diff downloads.
+	BinGithubURL   string    // Base URL for full binary downloads.
+	Dir            string    // Directory to store selfupdate state.
+	ForceCheck     bool      // Check for update regardless of cktime timestamp
+	CheckTime      int       // Time in hours before next check
+	RandomizeTime  int       // Time in hours to randomize with CheckTime
+	Requester      Requester // Optional parameter to override existing HTTP request handler
+	Info           struct {
+		Version string
+		Sha256  []byte
+		Desc    string
+	}
+	OnSuccessfulUpdate func() // Optional function to run after an update has successfully taken place
+
+	// Tracker 升级进度快照，可为 nil（所有打点方法都是 nil 安全的）。
+	// 传入后各阶段的起止、下载字节数会写进快照，供管理端轮询展示。
+	Tracker *ProgressTracker
+}
+
+func (u *Updater) getExecRelativeDir(dir string) string {
+	filename, _ := os.Executable()
+	path := filepath.Join(filepath.Dir(filename), dir)
+	return path
+}
+
+func canUpdate() (err error) {
+	// get the directory the file exists in
+	path, err := os.Executable()
+	if err != nil {
+		return
+	}
+
+	fileDir := filepath.Dir(path)
+	fileName := filepath.Base(path)
+
+	// attempt to open a file in the file's directory
+	newPath := stagePath(fileDir, fileName, stageNewSuffix)
+	// 残留的 .new 若带 HIDDEN/SYSTEM 属性，CREATE_ALWAYS 会直接 ACCESS_DENIED，
+	// 预检本身就会误报"目录不可写"。先清属性再删掉。
+	_ = removeFileForce(newPath)
+	fp, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return
+	}
+	fp.Close()
+
+	_ = removeFileForce(newPath)
+	return
+}
+
+// BackgroundRun starts the update check and apply cycle.
+func (u *Updater) BackgroundRun() error {
+
+	return u.BackgroundRunWithChannel("official")
+}
+func (u *Updater) BackgroundRunWithChannel(channel string) error {
+	if channel == "" || channel == "official" {
+		if err := os.MkdirAll(u.getExecRelativeDir(u.Dir), 0755); err != nil {
+			// fail
+			return err
+		}
+		// check to see if we want to check for updates based on version
+		// and last update time
+		if u.WantUpdate() {
+			if err := canUpdate(); err != nil {
+				// fail
+				return err
+			}
+
+			u.SetUpdateTime()
+
+			if err := u.Update(); err != nil {
+				return err
+			}
+		}
+	} else if channel == "github" {
+		if err := os.MkdirAll(u.getExecRelativeDir(u.Dir), 0755); err != nil {
+			// fail
+			return err
+		}
+		if err := canUpdate(); err != nil {
+			// fail
+			return err
+		}
+
+		u.SetUpdateTime()
+
+		if err := u.UpdateWithChannel(channel); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// WantUpdate returns boolean designating if an update is desired. If the app's version
+// is `dev` WantUpdate will return false. If u.ForceCheck is true or cktime is after now
+// WantUpdate will return true.
+func (u *Updater) WantUpdate() bool {
+	if u.CurrentVersion == "dev" || (!u.ForceCheck && u.NextUpdate().After(time.Now())) {
+		return false
+	}
+
+	return true
+}
+
+// NextUpdate returns the next time update should be checked
+func (u *Updater) NextUpdate() time.Time {
+	path := u.getExecRelativeDir(u.Dir + upcktimePath)
+	nextTime := readTime(path)
+
+	return nextTime
+}
+
+// SetUpdateTime writes the next update time to the state file
+func (u *Updater) SetUpdateTime() bool {
+	path := u.getExecRelativeDir(u.Dir + upcktimePath)
+	wait := time.Duration(u.CheckTime) * time.Hour
+	// Add 1 to random time since max is not included
+	waitrand := time.Duration(rand.Intn(u.RandomizeTime+1)) * time.Hour
+
+	return writeTime(path, time.Now().Add(wait+waitrand))
+}
+
+// ClearUpdateState writes current time to state file
+func (u *Updater) ClearUpdateState() {
+	path := u.getExecRelativeDir(u.Dir + upcktimePath)
+	os.Remove(path)
+}
+func (u *Updater) UpdateAvailableWithChannel(channel string) (bool, string, string, error) {
+
+	path, err := os.Executable()
+	if err != nil {
+		return false, "", "", err
+	}
+	old, err := os.Open(path)
+	if err != nil {
+		return false, "", "", err
+	}
+	defer old.Close()
+
+	//渠道选择
+	if channel == "" || channel == "official" {
+		// 这里只是版本检查，不属于升级流程，不打进度点
+		err = u.fetchInfo()
+		if err != nil {
+			return false, "", "", err
+		}
+		// 比较版本号
+		cmp := semver.Compare(u.Info.Version, u.CurrentVersion)
+		// 如果更新的版本大于当前版本，返回 true，表示有可用的更新
+		if cmp > 0 {
+			return true, u.Info.Version, u.Info.Desc, nil
+		} else {
+			// 否则，返回 false，表示没有可用的更新
+			return false, "", "", nil
+		}
+	} else if channel == "github" {
+		err = u.fetchInfoGithub()
+		if err != nil {
+			return false, "", "", err
+		}
+		// 比较版本号
+		cmp := semver.Compare(u.Info.Version, u.CurrentVersion)
+		// 如果更新的版本大于当前版本，返回 true，表示有可用的更新
+		if cmp > 0 {
+			return true, u.Info.Version, u.Info.Desc, nil
+		} else {
+			// 否则，返回 false，表示没有可用的更新
+			return false, "", "", nil
+		}
+	} else {
+		// 否则，返回 false，表示没有可用的更新
+		return false, "", "", nil
+	}
+}
+
+// UpdateAvailable 默认从官方下载
+func (u *Updater) UpdateAvailable() (bool, string, string, error) {
+	return u.UpdateAvailableWithChannel("official")
+}
+
+// Update initiates the self update process
+func (u *Updater) Update() error {
+	path, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	if resolvedPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolvedPath
+	}
+
+	// go fetch latest updates manifest
+	u.Tracker.StageStart(StageManifest)
+	err = u.fetchInfo()
+	if err != nil {
+		return err
+	}
+
+	// 检测是新版本才更新，否则不更新
+	cmp := semver.Compare(u.Info.Version, u.CurrentVersion)
+	if cmp <= 0 {
+		return nil
+	}
+	u.Tracker.StageDone(StageManifest, u.Info.Version)
+
+	old, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer old.Close()
+
+	// if patch failed grab the full new bin
+	bin, err := u.fetchAndVerifyFullBin()
+	if err != nil {
+		if err == ErrHashMismatch {
+			log.Println("update: hash mismatch from full binary")
+		} else {
+			log.Println("update: fetching full binary,", err)
+		}
+		return err
+	}
+
+	// close the old binary before installing because on windows
+	// it can't be renamed if a handle to the file is still open
+	old.Close()
+
+	u.Tracker.StageStart(StageExtract)
+	err, errRecover := fromStreamWithTracker(bytes.NewBuffer(bin), u.Tracker)
+	if errRecover != nil {
+		return fmt.Errorf("update and recovery errors: %q %q", err, errRecover)
+	}
+	if err != nil {
+		return err
+	}
+
+	// update was successful, run func if set
+	if u.OnSuccessfulUpdate != nil {
+		u.OnSuccessfulUpdate()
+	}
+
+	return nil
+}
+
+// UpdateWithChannel 通过渠道来检测
+func (u *Updater) UpdateWithChannel(channel string) error {
+	path, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	if resolvedPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolvedPath
+	}
+
+	if channel == "" || channel == "official" {
+		// go fetch latest updates manifest
+		u.Tracker.StageStart(StageManifest)
+		err = u.fetchInfo()
+		if err != nil {
+			return err
+		}
+
+		// 检测是新版本才更新，否则不更新
+		cmp := semver.Compare(u.Info.Version, u.CurrentVersion)
+		if cmp <= 0 {
+			return nil
+		}
+		u.Tracker.StageDone(StageManifest, u.Info.Version)
+
+		old, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer old.Close()
+
+		// if patch failed grab the full new bin
+		bin, err := u.fetchAndVerifyFullBin()
+		if err != nil {
+			if err == ErrHashMismatch {
+				log.Println("update: hash mismatch from full binary")
+			} else {
+				log.Println("update: fetching full binary,", err)
+			}
+			return err
+		}
+
+		// close the old binary before installing because on windows
+		// it can't be renamed if a handle to the file is still open
+		old.Close()
+
+		u.Tracker.StageStart(StageExtract)
+		err, errRecover := fromStreamWithTracker(bytes.NewBuffer(bin), u.Tracker)
+		if errRecover != nil {
+			return fmt.Errorf("update and recovery errors: %q %q", err, errRecover)
+		}
+		if err != nil {
+			return err
+		}
+
+		// update was successful, run func if set
+		if u.OnSuccessfulUpdate != nil {
+			u.OnSuccessfulUpdate()
+		}
+	} else if channel == "github" {
+		u.Tracker.StageStart(StageManifest)
+		err = u.fetchInfoGithub()
+		if err != nil {
+			return err
+		}
+		u.Tracker.StageDone(StageManifest, u.Info.Version)
+		// 从 GitHub 下载资源
+		u.Tracker.StageStart(StageDownload)
+		r, dlSize, err := u.fetchSized(u.BinGithubURL)
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		body := newProgressReader(r, u.Tracker, dlSize)
+
+		// 创建临时目录用于解压文件
+		tempDir, err := ioutil.TempDir("", "samwaf_beta_update"+u.Info.Version)
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(tempDir)
+
+		// 保存下载的文件到临时文件
+		tempFile := filepath.Join(tempDir, "download")
+		out, err := os.Create(tempFile)
+		if err != nil {
+			return err
+		}
+
+		_, err = io.Copy(out, body)
+		out.Close()
+		if err != nil {
+			return err
+		}
+		u.Tracker.StageDone(StageDownload, "")
+		// GitHub 渠道的包没有官方渠道那份 SHA256 清单，校验阶段不适用
+		u.Tracker.StageStart(StageExtract)
+
+		// 根据文件类型和平台解压并获取正确的可执行文件
+		var binPath string
+
+		if strings.HasSuffix(u.BinGithubURL, ".exe") {
+			//使用win7内核
+			binPath = tempFile
+		} else if strings.HasSuffix(u.BinGithubURL, ".zip") {
+			// 情况 1: 从 ZIP 中提取 SamWaf64.exe
+			err = utils.Unzip(tempFile, tempDir)
+			if err != nil {
+				return err
+			}
+			binPath = filepath.Join(tempDir, "SamWaf64.exe")
+		} else if strings.HasSuffix(u.BinGithubURL, ".tar.gz") {
+			// 处理 Linux 平台的 tar.gz 文件
+			err = utils.ExtractTarGz(tempFile, tempDir)
+			if err != nil {
+				return err
+			}
+
+			if strings.Contains(u.BinGithubURL, "Linux_x86_64") {
+				// 情况 2: 从 tar.gz 中提取 SamWafLinux64
+				binPath = filepath.Join(tempDir, "SamWafLinux64")
+			} else if strings.Contains(u.BinGithubURL, "Linux_arm64") {
+				// 情况 3: 从 tar.gz 中提取 SamWafLinuxArm64
+				binPath = filepath.Join(tempDir, "SamWafLinuxArm64")
+			}
+		}
+
+		// 检查是否找到了可执行文件
+		if binPath == "" {
+			return errors.New("无法找到适合当前平台的可执行文件")
+		}
+		fileBytes, err := ioutil.ReadFile(binPath)
+		if err != nil {
+			return err
+		}
+		err, errRecover := fromStreamWithTracker(bytes.NewBuffer(fileBytes), u.Tracker)
+		if errRecover != nil {
+			return fmt.Errorf("update and recovery errors: %q %q", err, errRecover)
+		}
+		if err != nil {
+			return err
+		}
+
+		// update was successful, run func if set
+		if u.OnSuccessfulUpdate != nil {
+			u.OnSuccessfulUpdate()
+		}
+	}
+
+	return nil
+}
+
+// fromStream 把新二进制落盘为 .new，再委托 replaceExecutable 完成原地替换。
+// 替换本身(唯一 .old 命名、属性清理、重试、旧二进制处置)统一在 binreplace.go，
+// 与 RollbackExecutable 共用，不要在这里再写一套 rename 技巧。
+func fromStream(updateWith io.Reader) (err error, errRecover error) {
+	return fromStreamWithTracker(updateWith, nil)
+}
+
+// fromStreamWithTracker 与 fromStream 相同，额外在"写完临时文件"与"开始替换"之间打点。
+func fromStreamWithTracker(updateWith io.Reader, tracker *ProgressTracker) (err error, errRecover error) {
+	updatePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	// 与 Update()/RollbackExecutable() 保持一致：替换软链指向的真实文件，而不是软链本身。
+	if resolved, e := filepath.EvalSymlinks(updatePath); e == nil {
+		updatePath = resolved
+	}
+
+	updateDir := filepath.Dir(updatePath)
+	filename := filepath.Base(updatePath)
+	newPath := stagePath(updateDir, filename, stageNewSuffix)
+
+	// 清掉上一轮遗留的 .new（可能带 HIDDEN，会让 CREATE_ALWAYS 直接 ACCESS_DENIED）
+	_ = removeFileForce(newPath)
+
+	fp, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		err = fmt.Errorf("%s", diagnoseFileOp("create", newPath, "", err))
+		return
+	}
+	// 原实现丢弃了 io.Copy 的错误(随后被 rename 的返回值覆盖)，
+	// 磁盘满/写盘中断会把半截二进制 rename 成主程序。这里必须逐步判错。
+	if _, cerr := io.Copy(fp, updateWith); cerr != nil {
+		fp.Close()
+		_ = removeFileForce(newPath)
+		err = fmt.Errorf("写入升级临时文件失败: %w", cerr)
+		return
+	}
+	// rename 前确保字节真正落盘
+	if serr := fp.Sync(); serr != nil {
+		fp.Close()
+		_ = removeFileForce(newPath)
+		err = fmt.Errorf("刷盘升级临时文件失败: %w", serr)
+		return
+	}
+	// 必须先 Close，否则 Windows 认为文件仍在使用、无法 rename
+	if cerr := fp.Close(); cerr != nil {
+		_ = removeFileForce(newPath)
+		err = fmt.Errorf("关闭升级临时文件失败: %w", cerr)
+		return
+	}
+
+	tracker.StageDone(StageExtract, filepath.Base(newPath))
+	tracker.StageStart(StageReplace)
+	err, errRecover = replaceExecutable(updatePath, newPath)
+	if err == nil && errRecover == nil {
+		tracker.StageDone(StageReplace, "")
+	}
+	return err, errRecover
+}
+
+// fetchInfo fetches the update JSON manifest at u.ApiURL/appname/platform.json?v=currentVersion
+// and updates u.Info.
+func (u *Updater) fetchInfo() error {
+	r, err := u.fetch(u.ApiURL + url.QueryEscape(u.CmdName) + "/" + url.QueryEscape(plat) + ".json?" + ClientQuery())
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	err = json.NewDecoder(r).Decode(&u.Info)
+	if err != nil {
+		return err
+	}
+	if len(u.Info.Sha256) != sha256.Size {
+		return errors.New("bad cmd hash in info")
+	}
+	return nil
+}
+
+// fetchInfoGithub 从GitHub获取最新beta版本信息
+func (u *Updater) fetchInfoGithub() error {
+	r, err := u.fetch(global.GUPDATE_GITHUB_VERSION_URL + "?" + ClientQuery())
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	// 解析GitHub API返回的JSON数据
+	var githubRelease struct {
+		TagName string `json:"tag_name"`
+		Name    string `json:"name"`
+		Body    string `json:"body"`
+		Assets  []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+			Size               int64  `json:"size"`
+			ContentType        string `json:"content_type"`
+		} `json:"assets"`
+	}
+
+	err = json.NewDecoder(r).Decode(&githubRelease)
+	if err != nil {
+		return err
+	}
+	//判断tagname 是否包含beta
+	if !strings.Contains(githubRelease.TagName, "beta") {
+		//return errors.New("not beta version")
+	}
+
+	// 过滤掉debug版本，防止用户意外升级到debug版本
+	if strings.Contains(githubRelease.TagName, "debug") || strings.Contains(strings.ToLower(githubRelease.Name), "debug") {
+		return errors.New("debug version detected, skipping update to prevent accidental upgrade")
+	}
+
+	// 查找适合当前平台的资源
+	var downloadURL string
+
+	// 根据平台选择合适的下载文件
+	platformSuffix := ""
+	utils.IsSupportedWindows7Version()
+	switch plat {
+	case "windows-amd64":
+		if utils.IsSupportedWindows7Version() {
+			platformSuffix = "SamWaf64ForWin7Win8Win2008"
+		} else {
+			platformSuffix = "Windows_x86_64"
+		}
+	case "linux-amd64":
+		platformSuffix = "Linux_x86_64"
+	case "linux-arm64":
+		platformSuffix = "Linux_arm64"
+	case "darwin-amd64":
+		platformSuffix = "Darwin_x86_64"
+	case "darwin-arm64":
+		platformSuffix = "Darwin_arm64"
+	}
+
+	// 查找匹配当前平台的资源，同时过滤掉debug版本
+	for _, asset := range githubRelease.Assets {
+		// 跳过包含DEBUG_SYMBOLS的文件
+		if strings.Contains(asset.Name, "DEBUG_SYMBOLS") || strings.Contains(strings.ToUpper(asset.Name), "DEBUG") {
+			continue
+		}
+		if strings.Contains(asset.Name, platformSuffix) {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+
+	// 如果没有找到适合的资源，返回错误
+	if downloadURL == "" {
+		return errors.New("no suitable release asset found for this platform")
+	}
+	u.BinGithubURL = downloadURL
+	u.Info.Version = githubRelease.TagName
+	u.Info.Desc = githubRelease.Body
+	return nil
+}
+
+func (u *Updater) fetchAndVerifyPatch(old io.Reader) ([]byte, error) {
+	bin, err := u.fetchAndApplyPatch(old)
+	if err != nil {
+		return nil, err
+	}
+	if !verifySha(bin, u.Info.Sha256) {
+		return nil, ErrHashMismatch
+	}
+	return bin, nil
+}
+
+func (u *Updater) fetchAndApplyPatch(old io.Reader) ([]byte, error) {
+	r, err := u.fetch(u.DiffURL + url.QueryEscape(u.CmdName) + "/" + url.QueryEscape(u.CurrentVersion) + "/" + url.QueryEscape(u.Info.Version) + "/" + url.QueryEscape(plat))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	var buf bytes.Buffer
+	err = binarydist.Patch(old, &buf, r)
+	return buf.Bytes(), err
+}
+
+func (u *Updater) fetchAndVerifyFullBin() ([]byte, error) {
+	u.Tracker.StageStart(StageDownload)
+	bin, err := u.fetchBin()
+	if err != nil {
+		return nil, err
+	}
+	u.Tracker.StageDone(StageDownload, "")
+
+	u.Tracker.StageStart(StageVerify)
+	verified := verifySha(bin, u.Info.Sha256)
+	if !verified {
+		return nil, ErrHashMismatch
+	}
+	u.Tracker.StageDone(StageVerify, "SHA256 校验通过")
+	return bin, nil
+}
+
+func (u *Updater) fetchBin() ([]byte, error) {
+	r, size, err := u.fetchSized(u.BinURL + url.QueryEscape(u.CmdName) + "/" + url.QueryEscape(u.Info.Version) + "/" + url.QueryEscape(plat) + ".gz")
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	// 计数放在 gzip 之外：Content-Length 是压缩包大小，两者口径要一致
+	body := newProgressReader(r, u.Tracker, size)
+	buf := new(bytes.Buffer)
+	gz, err := gzip.NewReader(body)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = io.Copy(buf, gz); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// fetchSized 在 fetch 基础上带出 Content-Length，用于下载进度百分比。
+// Requester 未实现 SizedRequester 时长度返回 0，界面退化为只显示已下载字节。
+func (u *Updater) fetchSized(url string) (io.ReadCloser, int64, error) {
+	if u.Requester == nil {
+		return defaultHTTPRequester.FetchWithSize(url)
+	}
+	if sized, ok := u.Requester.(SizedRequester); ok {
+		return sized.FetchWithSize(url)
+	}
+	readCloser, err := u.fetch(url)
+	return readCloser, 0, err
+}
+
+func (u *Updater) fetch(url string) (io.ReadCloser, error) {
+	if u.Requester == nil {
+		return defaultHTTPRequester.Fetch(url)
+	}
+
+	readCloser, err := u.Requester.Fetch(url)
+	if err != nil {
+		return nil, err
+	}
+
+	if readCloser == nil {
+		return nil, fmt.Errorf("Fetch was expected to return non-nil ReadCloser")
+	}
+
+	return readCloser, nil
+}
+
+func (u *Updater) GetHttps(url string) {
+
+}
+
+func readTime(path string) time.Time {
+	p, err := ioutil.ReadFile(path)
+	if os.IsNotExist(err) {
+		return time.Time{}
+	}
+	if err != nil {
+		return time.Now().Add(1000 * time.Hour)
+	}
+	t, err := time.Parse(time.RFC3339, string(p))
+	if err != nil {
+		return time.Now().Add(1000 * time.Hour)
+	}
+	return t
+}
+
+func verifySha(bin []byte, sha []byte) bool {
+	h := sha256.New()
+	h.Write(bin)
+	return bytes.Equal(h.Sum(nil), sha)
+}
+
+func writeTime(path string, t time.Time) bool {
+	return ioutil.WriteFile(path, []byte(t.Format(time.RFC3339)), 0644) == nil
+}
+
+// BackupExecutable 备份当前可执行文件，并写入版本号 sidecar 文件
+func BackupExecutable() error {
+	execPath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolvedPath, err := filepath.EvalSymlinks(execPath); err == nil {
+		execPath = resolvedPath
+	}
+
+	currentDir := utils.GetCurrentDir()
+	backupDir := filepath.Join(currentDir, "data", "backups_bin")
+	fileName := filepath.Base(execPath)
+	fileNameWithoutExt := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+
+	backupPath, err := utils.BackupFile(execPath, backupDir, fileNameWithoutExt, 5)
+	if err != nil {
+		return err
+	}
+	// 写版本 sidecar，供 ListBackups 读取
+	sidecarPath := strings.TrimSuffix(backupPath, filepath.Ext(backupPath)) + ".version"
+	_ = os.WriteFile(sidecarPath, []byte(global.GWAF_RELEASE_VERSION), 0644)
+	return nil
+}
+
+// BackupInfo 描述一个备份版本的元信息
+type BackupInfo struct {
+	FileName   string    `json:"file_name"`
+	Version    string    `json:"version"`     // 来自 sidecar；旧备份无 sidecar 时为 "unknown"
+	BackupTime time.Time `json:"backup_time"` // 文件 ModTime
+	FileSize   int64     `json:"file_size"`
+}
+
+// ListBackups 列出所有可用的备份版本，按时间倒序（最新在前）
+func ListBackups() ([]BackupInfo, error) {
+	currentDir := utils.GetCurrentDir()
+	backupDir := filepath.Join(currentDir, "data", "backups_bin")
+
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []BackupInfo{}, nil
+		}
+		return nil, err
+	}
+
+	execPath, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	if resolvedPath, err := filepath.EvalSymlinks(execPath); err == nil {
+		execPath = resolvedPath
+	}
+	fileName := filepath.Base(execPath)
+	fileNameWithoutExt := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+
+	var list []BackupInfo
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// 跳过 sidecar 文件
+		if strings.HasSuffix(name, ".version") {
+			continue
+		}
+		// 只处理与当前程序同名前缀的备份
+		if !strings.HasPrefix(name, fileNameWithoutExt+"_") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		bi := BackupInfo{
+			FileName:   name,
+			Version:    "unknown",
+			BackupTime: info.ModTime(),
+			FileSize:   info.Size(),
+		}
+		// 尝试读取版本 sidecar
+		sidecarPath := filepath.Join(backupDir, strings.TrimSuffix(name, filepath.Ext(name))+".version")
+		if versionBytes, err := os.ReadFile(sidecarPath); err == nil {
+			bi.Version = strings.TrimSpace(string(versionBytes))
+		}
+		list = append(list, bi)
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].BackupTime.After(list[j].BackupTime)
+	})
+	return list, nil
+}
+
+// RollbackExecutable 将可执行文件回退到指定版本的备份
+// version 为空时取最新备份
+func RollbackExecutable(version string) error {
+	list, err := ListBackups()
+	if err != nil {
+		return fmt.Errorf("列出备份失败: %w", err)
+	}
+	if len(list) == 0 {
+		return fmt.Errorf("没有可用的备份版本")
+	}
+
+	var target *BackupInfo
+	if version == "" {
+		target = &list[0]
+	} else {
+		for i := range list {
+			if list[i].Version == version {
+				target = &list[i]
+				break
+			}
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("未找到版本 %s 的备份", version)
+	}
+
+	execPath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolvedPath, err := filepath.EvalSymlinks(execPath); err == nil {
+		execPath = resolvedPath
+	}
+
+	updateDir := filepath.Dir(execPath)
+	filename := filepath.Base(execPath)
+
+	currentDir := utils.GetCurrentDir()
+	backupDir := filepath.Join(currentDir, "data", "backups_bin")
+	backupFilePath := filepath.Join(backupDir, target.FileName)
+
+	// 将备份复制到临时文件
+	rollbackPath := stagePath(updateDir, filename, stageRollbackSuffix)
+	_ = removeFileForce(rollbackPath)
+	src, err := os.Open(backupFilePath)
+	if err != nil {
+		return fmt.Errorf("打开备份文件失败: %w", err)
+	}
+	dst, err := os.OpenFile(rollbackPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		src.Close()
+		return fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	_, copyErr := io.Copy(dst, src)
+	src.Close()
+	if syncErr := dst.Sync(); syncErr != nil && copyErr == nil {
+		copyErr = syncErr
+	}
+	if closeErr := dst.Close(); closeErr != nil && copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		_ = removeFileForce(rollbackPath)
+		return fmt.Errorf("复制备份文件失败: %w", copyErr)
+	}
+
+	// 与升级共用同一套替换底座（唯一 .old 命名 + 属性清理 + 重试 + 旧二进制处置）。
+	// 旧实现在这里复制了一份固定名 .old 的 rename 技巧，同样会在 Windows 上
+	// 撞到"目标已存在且被常驻 Supervisor 占用"而失败——即 supervisor.rollbackBinary()
+	// 的自动回滚在 Windows 生产上一直是坏的。
+	repErr, recoverErr := replaceExecutable(execPath, rollbackPath)
+	if repErr != nil {
+		if recoverErr != nil {
+			return fmt.Errorf("回退失败且未能恢复原程序(需人工介入): %v ; 恢复错误: %v", repErr, recoverErr)
+		}
+		return fmt.Errorf("回退失败(原程序已恢复): %w", repErr)
+	}
+	return nil
+}

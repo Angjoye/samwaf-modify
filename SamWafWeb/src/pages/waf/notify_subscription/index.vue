@@ -1,0 +1,866 @@
+<template>
+  <div>
+    <t-card class="list-card-container">
+      <div class="page-header">
+        <div class="page-header-main">
+          <h3>{{ $t('page.notify_subscription.page_title') }} </h3>
+          <p class="page-desc">{{ $t('page.notify_subscription.alert_message') }}</p>
+        </div>
+        <t-button variant="outline" @click="globalDialogVisible = true">
+          <t-icon name="setting" /> {{ $t('page.notify_subscription.button_global_config') }}
+        </t-button>
+      </div>
+
+      <t-loading :loading="dataLoading" size="large">
+        <t-table
+          :data="tableData"
+          :columns="tableColumns"
+          row-key="messageType"
+          :bordered="true"
+          :hover="true"
+          table-layout="auto"
+        >
+          <!-- 消息类型列 -->
+          <template #messageType="{ row }">
+            <div class="message-type-cell">
+              <div class="message-type-name">{{ row.messageTypeName }}</div>
+            </div>
+          </template>
+
+          <!-- 渠道表头：5 个渠道共用一个组件，加菜单项只改一处 -->
+          <template v-for="ct in channelTypes" v-slot:[ct.titleSlot]>
+            <channel-header :key="ct.type" :type="ct.type" :label="ct.name" :theme="ct.theme" @batch="handleBatchAction" />
+          </template>
+
+          <!-- 渠道单元格 -->
+          <template v-for="ct in channelTypes" v-slot:[ct.type]="{ row }">
+            <channel-cell
+              :key="ct.type"
+              :channels="row.channels[ct.type]"
+              :message-type="row.messageType"
+              :channel-type="ct.type"
+              @add="onCellAdd"
+              @toggle="onCellToggle"
+              @edit-recipients="onCellEditRecipients"
+              @config="onCellConfig"
+              @remove="onCellRemove"
+            />
+          </template>
+        </t-table>
+      </t-loading>
+    </t-card>
+
+    <!-- 单个订阅的精细化配置（频控/模板/过滤/测试） -->
+    <config-drawer
+      :visible.sync="configDrawerVisible"
+      :subscription="configSubscription"
+      :channel-name="configChannelName"
+      :channel-type="configChannelType"
+      :message-type-name="configMessageTypeName"
+      @saved="loadSubscriptionList"
+    />
+
+    <!-- 按渠道类型批量套用频控配置 -->
+    <batch-config-dialog
+      :visible.sync="batchConfigVisible"
+      :channel-type="batchConfigChannelType"
+      :channel-label="batchConfigChannelName"
+      @saved="loadSubscriptionList"
+    />
+
+    <!-- 全局默认频控配置 -->
+    <global-throttle-dialog :visible.sync="globalDialogVisible" />
+
+    <!-- 邮箱收件人配置对话框 -->
+    <t-dialog
+      :header="'配置邮件收件人 - ' + getChannelName(emailFormData.channel_id)"
+      :visible.sync="emailDialogVisible"
+      :width="600"
+      :footer="false"
+    >
+      <div slot="body">
+        <t-form :data="emailFormData" ref="emailForm" @submit="onEmailSubmit" :labelWidth="120">
+          <t-form-item :label="$t('page.notify_subscription.label_message_type')">
+            <t-tag theme="primary">{{ getMessageTypeName(emailFormData.message_type) }}</t-tag>
+          </t-form-item>
+          <t-form-item :label="$t('page.notify_subscription.label_recipients')" name="recipients">
+            <t-input
+              :style="{ width: '100%' }"
+              v-model="emailFormData.recipients"
+              :placeholder="$t('page.notify_subscription.recipients_placeholder')"
+            />
+            <div style="font-size: 12px; color: #666; margin-top: 4px;">
+              💡 <b>可选</b>：为此订阅单独指定收件人（多个邮箱用逗号分隔），不填则用渠道默认值
+            </div>
+          </t-form-item>
+          <t-form-item style="float: right">
+            <t-button variant="outline" @click="onEmailDialogClose">{{ $t('common.close') }}</t-button>
+            <t-button theme="primary" type="submit">{{ $t('common.confirm') }}</t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+    </t-dialog>
+
+    <!-- 删除确认对话框 -->
+    <t-dialog
+      :header="$t('common.confirm_delete')"
+      :body="confirmBody"
+      :visible.sync="confirmVisible"
+      @confirm="onConfirmDelete"
+      :onCancel="onCancel"
+    >
+    </t-dialog>
+
+    <!-- 批量操作确认对话框 -->
+    <t-dialog
+      :header="batchConfirmType === 'delete' ? $t('page.notify_subscription.batch_delete_confirm', { channel: batchConfirmChannelName }) : $t('page.notify_subscription.batch_disable_confirm', { channel: batchConfirmChannelName })"
+      :body="batchConfirmType === 'delete' ? $t('page.notify_subscription.batch_delete_confirm_content') : $t('page.notify_subscription.batch_disable_confirm_content')"
+      :visible.sync="batchConfirmVisible"
+      @confirm="onBatchConfirm"
+      :confirm-btn="$t('common.confirm')"
+      :cancel-btn="$t('common.cancel')"
+    >
+    </t-dialog>
+  </div>
+</template>
+
+<script lang="ts">
+import Vue from 'vue';
+import { MessagePlugin } from 'tdesign-vue';
+import {
+  getNotifySubscriptionList,
+  addNotifySubscription,
+  editNotifySubscription,
+  deleteNotifySubscription,
+} from '@/apis/notify_subscription';
+import { getNotifyChannelList } from '@/apis/notify_channel';
+import ChannelHeader from './components/ChannelHeader.vue';
+import ChannelCell from './components/ChannelCell.vue';
+import ConfigDrawer from './components/ConfigDrawer.vue';
+import BatchConfigDialog from './components/BatchConfigDialog.vue';
+import GlobalThrottleDialog from './components/GlobalThrottleDialog.vue';
+
+export default Vue.extend({
+  name: 'NotifySubscription',
+  components: { ChannelHeader, ChannelCell, ConfigDrawer, BatchConfigDialog, GlobalThrottleDialog },
+  data() {
+    return {
+      dataLoading: false,
+      channelList: [],
+      subscriptionList: [],
+      // titleSlot 预先算好：Vue2 的动态插槽名不允许表达式里出现引号，
+      // 写成 v-slot:[ct.type+'-title'] 会直接编译失败
+      channelTypes: [
+        { type: 'dingtalk', name: '钉钉', theme: 'primary', titleSlot: 'dingtalk-title' },
+        { type: 'feishu', name: '飞书', theme: 'success', titleSlot: 'feishu-title' },
+        { type: 'email', name: '邮箱', theme: 'warning', titleSlot: 'email-title' },
+        { type: 'serverchan', name: 'Server酱', theme: 'danger', titleSlot: 'serverchan-title' },
+        { type: 'wechatwork', name: '企业微信', theme: 'primary', titleSlot: 'wechatwork-title' },
+        { type: 'webhook', name: '自定义Webhook', theme: 'success', titleSlot: 'webhook-title' },
+      ],
+      messageTypes: [
+        {
+          type: 'user_login',
+          name: this.$t('page.notify_subscription.message_type_user_login'),
+        },
+        {
+          type: 'rule_trigger',
+          name: this.$t('page.notify_subscription.message_type_rule_trigger'),
+        },
+        {
+          type: 'ip_ban',
+          name: this.$t('page.notify_subscription.message_type_ip_ban'),
+        },
+        {
+          type: 'attack_info',
+          name: this.$t('page.notify_subscription.message_type_attack_info'),
+        },
+        {
+          type: 'ssl_expire',
+          name: this.$t('page.notify_subscription.message_type_ssl_expire'),
+        },
+        {
+          type: 'weekly_report',
+          name: this.$t('page.notify_subscription.message_type_weekly_report'),
+        },
+        {
+          type: 'system_error',
+          name: this.$t('page.notify_subscription.message_type_system_error'),
+        },
+        {
+          type: 'operation_notice',
+          name: this.$t('page.notify_subscription.message_type_operation_notice'),
+        },
+        // 统一访问认证拆成两类：登录成功是日常告知，异常是安全告警。
+        // 合成一类的话，只想收告警的人会被每次正常登录打扰，最后干脆退订，告警也就收不到了。
+        {
+          type: 'access_login',
+          name: this.$t('page.notify_subscription.message_type_access_login'),
+        },
+        {
+          type: 'access_abnormal',
+          name: this.$t('page.notify_subscription.message_type_access_abnormal'),
+        },
+        // 管理端登录来源变化：同理和 user_login 拆开，只想收"可能是别人登进来了"的人不必订阅日常登录
+        {
+          type: 'manage_login_abnormal',
+          name: this.$t('page.notify_subscription.message_type_manage_login_abnormal'),
+        },
+      ],
+      emailDialogVisible: false,
+      emailFormData: {
+        subscription_id: '',
+        message_type: '',
+        channel_id: '',
+        recipients: '',
+        status: 1,
+      } as any,
+      confirmVisible: false,
+      confirmBody: '',
+      formEditData: {} as any,
+      // 批量操作确认对话框
+      batchConfirmVisible: false,
+      batchConfirmType: '', // 'delete' or 'disable'
+      batchConfirmChannelType: '',
+      batchConfirmChannelName: '',
+      // 精细化配置（issue #822）
+      configDrawerVisible: false,
+      configSubscription: {} as any,
+      configChannelName: '',
+      configChannelType: '',
+      configMessageTypeName: '',
+      batchConfigVisible: false,
+      batchConfigChannelType: '',
+      batchConfigChannelName: '',
+      globalDialogVisible: false,
+    };
+  },
+  computed: {
+    tableColumns() {
+      const columns: any[] = [
+        {
+          colKey: 'messageType',
+          title: this.$t('page.notify_subscription.label_message_type'),
+          width: 200,
+          fixed: 'left',
+        },
+      ];
+
+      // 动态添加渠道类型列
+      this.channelTypes.forEach((channelType: any) => {
+        columns.push({
+          colKey: channelType.type,
+          title: `${channelType.type}-title`, // 指定title slot名称
+          minWidth: 200,
+        });
+      });
+
+      return columns;
+    },
+    tableData() {
+      return this.messageTypes.map((msgType: any) => {
+        const row: any = {
+          messageType: msgType.type,
+          messageTypeName: msgType.name,
+          channels: {},
+        };
+
+        // 为每个渠道类型收集该类型的所有渠道及其订阅状态
+        this.channelTypes.forEach((channelType: any) => {
+          const channelsOfType = this.channelList
+            .filter((ch: any) => ch.type === channelType.type)
+            .map((channel: any) => {
+              const subscription = this.subscriptionList.find(
+                (sub: any) => sub.message_type === msgType.type && sub.channel_id === channel.id
+              );
+              return {
+                ...channel,
+                subscription: subscription || null,
+              };
+            });
+          row.channels[channelType.type] = channelsOfType;
+        });
+
+        return row;
+      });
+    },
+  },
+  mounted() {
+    this.loadData();
+  },
+  methods: {
+    async loadData() {
+      this.dataLoading = true;
+      try {
+        await Promise.all([
+          this.loadChannelList(),
+          this.loadSubscriptionList(),
+        ]);
+      } catch (e) {
+        console.error(e);
+      } finally {
+        this.dataLoading = false;
+      }
+    },
+    async loadChannelList() {
+      try {
+        const res = await getNotifyChannelList({ pageIndex: 1, pageSize: 100 });
+        if (res.code === 0) {
+          this.channelList = res.data.list || [];
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    },
+    async loadSubscriptionList() {
+      try {
+        const res = await getNotifySubscriptionList({ pageIndex: 1, pageSize: 100000 });
+        if (res.code === 0) {
+          this.subscriptionList = res.data.list || [];
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    },
+    getChannelsByType(type: string) {
+      return this.channelList.filter((c: any) => c.type === type);
+    },
+    getSubscription(messageType: string, channelId: string) {
+      return this.subscriptionList.find(
+        (sub: any) => sub.message_type === messageType && sub.channel_id === channelId
+      );
+    },
+    getChannelName(channelId: string) {
+      const channel = this.channelList.find((c: any) => c.id === channelId);
+      return channel ? channel.name : '';
+    },
+    getMessageTypeName(type: string) {
+      const msgType = this.messageTypes.find((m: any) => m.type === type);
+      return msgType ? msgType.name : type;
+    },
+    // 获取渠道类型名称
+    getChannelTypeName(channelType: string) {
+      const type = this.channelTypes.find((t: any) => t.type === channelType);
+      return type ? type.name : channelType;
+    },
+
+    // ===== 单元格事件 =====
+    onCellAdd({ messageType, channel }: any) {
+      this.handleAddSubscription(messageType, channel);
+    },
+    onCellToggle({ messageType, channel, value }: any) {
+      this.handleChannelToggle(messageType, channel, value);
+    },
+    onCellEditRecipients({ messageType, channel }: any) {
+      this.handleEditRecipients(messageType, channel);
+    },
+    onCellRemove({ messageType, channelId }: any) {
+      this.handleDeleteSubscription(messageType, channelId);
+    },
+    // 打开精细化配置抽屉
+    onCellConfig({ messageType, channel }: any) {
+      const subscription = this.getSubscription(messageType, channel.id);
+      if (!subscription) {
+        MessagePlugin.warning('订阅不存在');
+        return;
+      }
+      this.configSubscription = subscription;
+      this.configChannelName = channel.name;
+      this.configChannelType = channel.type;
+      this.configMessageTypeName = this.getMessageTypeName(messageType);
+      this.configDrawerVisible = true;
+    },
+
+    // ===== 表头批量菜单 =====
+    handleBatchAction({ action, type }: any) {
+      switch (action) {
+        case 'add':
+          this.handleBatchAdd(type);
+          break;
+        case 'enable':
+          this.handleBatchEnable(type);
+          break;
+        case 'disable':
+          this.handleBatchDisable(type);
+          break;
+        case 'delete':
+          this.handleBatchDelete(type);
+          break;
+        case 'config':
+          this.batchConfigChannelType = type;
+          this.batchConfigChannelName = this.getChannelTypeName(type);
+          this.batchConfigVisible = true;
+          break;
+        default:
+          break;
+      }
+    },
+
+    async onConfirmDelete() {
+      if (this.formEditData && this.formEditData.id) {
+        await this.deleteSubscription(this.formEditData.id);
+        this.confirmVisible = false;
+      }
+    },
+    onCancel() {
+      this.confirmVisible = false;
+    },
+    handleAddSubscription(messageType: string, channel: any) {
+      // 如果渠道被禁用，不允许添加
+      if (channel.status === 0) {
+        MessagePlugin.warning('该渠道已被禁用，无法添加订阅');
+        return;
+      }
+
+      // 邮箱渠道需要配置收件人
+      if (channel.type === 'email') {
+        this.emailFormData = {
+          subscription_id: '', // 新增订阅，ID为空
+          message_type: messageType,
+          channel_id: channel.id,
+          recipients: '',
+          status: 1,
+        };
+        this.emailDialogVisible = true;
+      } else {
+        // 其他渠道直接添加
+        this.addSubscription(messageType, channel.id, '');
+      }
+    },
+    handleEditRecipients(messageType: string, channel: any) {
+      const subscription = this.getSubscription(messageType, channel.id);
+      this.emailFormData = {
+        subscription_id: subscription?.id || '', // 添加订阅ID
+        message_type: messageType,
+        channel_id: channel.id,
+        recipients: subscription?.recipients || '',
+        status: 1,
+      };
+      this.emailDialogVisible = true;
+    },
+    async handleChannelToggle(messageType: string, channel: any, enabled: boolean) {
+      const subscription = this.getSubscription(messageType, channel.id);
+
+      if (!subscription) {
+        // 不应该发生这种情况，因为没有订阅时显示的是+号
+        MessagePlugin.warning('订阅不存在');
+        return;
+      }
+
+      // 切换启用/禁用状态
+      subscription.status = enabled ? 1 : 0;
+      try {
+        const res = await editNotifySubscription(subscription);
+        if (res.code === 0) {
+          MessagePlugin.success(enabled ? '已启用订阅' : '已禁用订阅');
+          await this.loadSubscriptionList();
+        } else {
+          MessagePlugin.error(res.msg || '操作失败');
+          await this.loadSubscriptionList();
+        }
+      } catch (error) {
+        MessagePlugin.error('操作失败');
+        await this.loadSubscriptionList();
+      }
+    },
+    handleDeleteSubscription(messageType: string, channelId: string) {
+      const subscription = this.getSubscription(messageType, channelId);
+      if (!subscription) return;
+
+      // 使用t-dialog的确认对话框
+      this.formEditData = subscription;
+      this.confirmBody = '确定要删除这个订阅吗？';
+      this.confirmVisible = true;
+    },
+    async addSubscription(messageType: string, channelId: string, recipients: string, silent = false) {
+      try {
+        const data = {
+          message_type: messageType,
+          channel_id: channelId,
+          recipients: recipients,
+          status: 1,
+          filter_json: '',
+          remarks: '',
+        };
+
+        const res = await addNotifySubscription(data);
+        if (res.code === 0) {
+          if (!silent) {
+            MessagePlugin.success(this.$t('page.notify_subscription.add_success'));
+          }
+          await this.loadSubscriptionList();
+          return true;
+        } else {
+          if (!silent) {
+            MessagePlugin.error(res.msg || this.$t('page.notify_subscription.add_failed'));
+          }
+          await this.loadSubscriptionList();
+          return false;
+        }
+      } catch (error) {
+        console.error(error);
+        if (!silent) {
+          MessagePlugin.error(this.$t('page.notify_subscription.add_failed'));
+        }
+        await this.loadSubscriptionList();
+        return false;
+      }
+    },
+    async updateSubscription(subscriptionId: string, recipients: string) {
+      try {
+        // 获取完整的订阅信息
+        const subscription = this.subscriptionList.find((s: any) => s.id === subscriptionId);
+        if (!subscription) {
+          MessagePlugin.error('订阅信息不存在');
+          return;
+        }
+
+        // 只提交编辑相关字段：频控/模板由独立接口保存，
+        // 这里带上它们反而可能因为前端缓存过期把用户配好的内容覆盖掉
+        const data = {
+          id: subscriptionId,
+          message_type: subscription.message_type,
+          channel_id: subscription.channel_id,
+          recipients: recipients,
+          status: subscription.status,
+          filter_json: subscription.filter_json || '',
+          remarks: subscription.remarks || '',
+        };
+
+        const res = await editNotifySubscription(data);
+        if (res.code === 0) {
+          MessagePlugin.success('修改收件人成功');
+          await this.loadSubscriptionList();
+        } else {
+          MessagePlugin.error(res.msg || '修改收件人失败');
+          await this.loadSubscriptionList();
+        }
+      } catch (error) {
+        console.error(error);
+        MessagePlugin.error('修改收件人失败');
+        await this.loadSubscriptionList();
+      }
+    },
+    async deleteSubscription(subscriptionId: string, silent = false) {
+      try {
+        const res = await deleteNotifySubscription({ id: subscriptionId });
+        if (res.code === 0) {
+          if (!silent) {
+            MessagePlugin.success(this.$t('page.notify_subscription.delete_success'));
+          }
+          await this.loadSubscriptionList();
+          return true;
+        } else {
+          if (!silent) {
+            MessagePlugin.error(res.msg || this.$t('page.notify_subscription.delete_failed'));
+          }
+          await this.loadSubscriptionList();
+          return false;
+        }
+      } catch (error) {
+        console.error(error);
+        if (!silent) {
+          MessagePlugin.error(this.$t('page.notify_subscription.delete_failed'));
+        }
+        await this.loadSubscriptionList();
+        return false;
+      }
+    },
+    async onEmailSubmit({ validateResult, firstError }: any) {
+      if (validateResult === true) {
+        // 判断是新增还是编辑
+        if (this.emailFormData.subscription_id) {
+          // 编辑现有订阅
+          await this.updateSubscription(
+            this.emailFormData.subscription_id,
+            this.emailFormData.recipients
+          );
+        } else {
+          // 新增订阅
+          await this.addSubscription(
+            this.emailFormData.message_type,
+            this.emailFormData.channel_id,
+            this.emailFormData.recipients
+          );
+        }
+        this.emailDialogVisible = false;
+      } else {
+        if (firstError) {
+          MessagePlugin.warning(firstError);
+        }
+      }
+    },
+    onEmailDialogClose() {
+      this.emailDialogVisible = false;
+      this.loadSubscriptionList();
+    },
+    // 批量增加订阅
+    async handleBatchAdd(channelType: string) {
+      const channelsOfType = this.getChannelsByType(channelType);
+      if (channelsOfType.length === 0) {
+        MessagePlugin.warning(`当前没有可用的${this.getChannelTypeName(channelType)}渠道`);
+        return;
+      }
+
+      let successCount = 0;
+      let failCount = 0;
+
+      // 为所有消息类型和该类型的所有渠道添加订阅
+      for (const messageType of this.messageTypes) {
+        for (const channel of channelsOfType) {
+          const subscription = this.getSubscription(messageType.type, channel.id);
+          if (!subscription && channel.status === 1) {
+            const result = await this.addSubscription(messageType.type, channel.id, '', true); // silent模式
+            if (result) {
+              successCount++;
+            } else {
+              failCount++;
+            }
+          }
+        }
+      }
+
+      // 显示汇总结果
+      if (successCount > 0 || failCount > 0) {
+        const channelName = this.getChannelTypeName(channelType);
+        if (failCount === 0) {
+          MessagePlugin.success(this.$t('page.notify_subscription.batch_add_success', { channel: channelName, count: successCount }));
+        } else if (successCount === 0) {
+          MessagePlugin.error(this.$t('page.notify_subscription.batch_add_failed', { channel: channelName, count: failCount }));
+        } else {
+          MessagePlugin.warning(this.$t('page.notify_subscription.batch_add_partial', { channel: channelName, success: successCount, fail: failCount }));
+        }
+      } else {
+        MessagePlugin.info(this.$t('page.notify_subscription.batch_add_already_exist', { channel: this.getChannelTypeName(channelType) }));
+      }
+    },
+    // 批量删除订阅
+    async handleBatchDelete(channelType: string) {
+      const channelsOfType = this.getChannelsByType(channelType);
+      if (channelsOfType.length === 0) {
+        MessagePlugin.warning(`当前没有${this.getChannelTypeName(channelType)}渠道的订阅`);
+        return;
+      }
+
+      const subscriptionsToDelete: string[] = [];
+      for (const channel of channelsOfType) {
+        for (const subscription of this.subscriptionList) {
+          if (subscription.channel_id === channel.id) {
+            subscriptionsToDelete.push(subscription.id);
+          }
+        }
+      }
+
+      if (subscriptionsToDelete.length === 0) {
+        MessagePlugin.warning(`当前没有${this.getChannelTypeName(channelType)}渠道的订阅`);
+        return;
+      }
+
+      // 显示确认对话框
+      this.batchConfirmType = 'delete';
+      this.batchConfirmChannelType = channelType;
+      this.batchConfirmChannelName = this.getChannelTypeName(channelType);
+      this.batchConfirmVisible = true;
+    },
+    // 批量开启订阅
+    async handleBatchEnable(channelType: string) {
+      const channelsOfType = this.getChannelsByType(channelType);
+      if (channelsOfType.length === 0) {
+        MessagePlugin.warning(`当前没有${this.getChannelTypeName(channelType)}渠道的订阅`);
+        return;
+      }
+
+      // 先检查该渠道类型是否有订阅
+      let totalCount = 0;
+      let updatedCount = 0;
+      for (const channel of channelsOfType) {
+        for (const subscription of this.subscriptionList) {
+          if (subscription.channel_id === channel.id) {
+            totalCount++;
+            if (subscription.status === 0) {
+              await this.toggleSubscriptionStatus(subscription.id, 1);
+              updatedCount++;
+            }
+          }
+        }
+      }
+
+      const channelName = this.getChannelTypeName(channelType);
+      if (totalCount === 0) {
+        MessagePlugin.info(this.$t('page.notify_subscription.batch_enable_no_subscription', { channel: channelName }));
+      } else if (updatedCount === 0) {
+        MessagePlugin.info(this.$t('page.notify_subscription.batch_enable_all_enabled', { channel: channelName, count: totalCount }));
+      } else {
+        MessagePlugin.success(this.$t('page.notify_subscription.batch_enable_success', { channel: channelName, count: updatedCount }));
+      }
+    },
+    // 批量禁用订阅
+    async handleBatchDisable(channelType: string) {
+      const channelsOfType = this.getChannelsByType(channelType);
+      if (channelsOfType.length === 0) {
+        MessagePlugin.warning(`当前没有${this.getChannelTypeName(channelType)}渠道的订阅`);
+        return;
+      }
+
+      // 先检查该渠道类型是否有订阅以及需要禁用的订阅数量
+      let totalCount = 0;
+      let toDisableCount = 0;
+      const channelName = this.getChannelTypeName(channelType);
+
+      for (const channel of channelsOfType) {
+        for (const subscription of this.subscriptionList) {
+          if (subscription.channel_id === channel.id) {
+            totalCount++;
+            if (subscription.status === 1) {
+              toDisableCount++;
+            }
+          }
+        }
+      }
+
+      if (totalCount === 0) {
+        MessagePlugin.info(this.$t('page.notify_subscription.batch_disable_no_subscription', { channel: channelName }));
+        return;
+      }
+
+      if (toDisableCount === 0) {
+        MessagePlugin.info(this.$t('page.notify_subscription.batch_disable_all_disabled', { channel: channelName, count: totalCount }));
+        return;
+      }
+
+      // 显示确认对话框
+      this.batchConfirmType = 'disable';
+      this.batchConfirmChannelType = channelType;
+      this.batchConfirmChannelName = channelName;
+      this.batchConfirmVisible = true;
+    },
+    // 切换订阅状态
+    async toggleSubscriptionStatus(subscriptionId: string, status: number) {
+      const subscription = this.subscriptionList.find((s: any) => s.id === subscriptionId);
+      if (!subscription) {
+        return;
+      }
+
+      const data = {
+        id: subscriptionId,
+        message_type: subscription.message_type,
+        channel_id: subscription.channel_id,
+        recipients: subscription.recipients || '',
+        status: status,
+        filter_json: subscription.filter_json || '',
+        remarks: subscription.remarks || '',
+      };
+
+      await editNotifySubscription(data);
+      await this.loadSubscriptionList();
+    },
+    // 批量操作确认处理
+    async onBatchConfirm() {
+      this.batchConfirmVisible = false;
+
+      if (this.batchConfirmType === 'delete') {
+        await this.executeBatchDelete();
+      } else if (this.batchConfirmType === 'disable') {
+        await this.executeBatchDisable();
+      }
+    },
+    // 执行批量删除
+    async executeBatchDelete() {
+      const channelsOfType = this.getChannelsByType(this.batchConfirmChannelType);
+      const subscriptionsToDelete: string[] = [];
+
+      for (const channel of channelsOfType) {
+        for (const subscription of this.subscriptionList) {
+          if (subscription.channel_id === channel.id) {
+            subscriptionsToDelete.push(subscription.id);
+          }
+        }
+      }
+
+      let successCount = 0;
+      let failCount = 0;
+
+      for (const id of subscriptionsToDelete) {
+        const result = await this.deleteSubscription(id, true);
+        if (result) {
+          successCount++;
+        } else {
+          failCount++;
+        }
+      }
+
+      const channelName = this.batchConfirmChannelName;
+      if (failCount === 0) {
+        MessagePlugin.success(this.$t('page.notify_subscription.batch_delete_success', { channel: channelName, count: successCount }));
+      } else if (successCount === 0) {
+        MessagePlugin.error(this.$t('page.notify_subscription.batch_delete_failed', { channel: channelName, count: failCount }));
+      } else {
+        MessagePlugin.warning(this.$t('page.notify_subscription.batch_delete_partial', { channel: channelName, success: successCount, fail: failCount }));
+      }
+    },
+    // 执行批量禁用
+    async executeBatchDisable() {
+      const channelsOfType = this.getChannelsByType(this.batchConfirmChannelType);
+      let updatedCount = 0;
+
+      for (const channel of channelsOfType) {
+        for (const subscription of this.subscriptionList) {
+          if (subscription.channel_id === channel.id && subscription.status === 1) {
+            await this.toggleSubscriptionStatus(subscription.id, 0);
+            updatedCount++;
+          }
+        }
+      }
+
+      if (updatedCount > 0) {
+        MessagePlugin.success(this.$t('page.notify_subscription.batch_disable_success', { channel: this.batchConfirmChannelName, count: updatedCount }));
+      }
+    },
+  },
+});
+</script>
+
+<style lang="less" scoped>
+.list-card-container {
+  padding: 24px;
+}
+
+.page-header {
+  margin-bottom: 24px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+
+  .page-header-main {
+    flex: 1;
+  }
+
+  h3 {
+    margin: 0 0 8px 0;
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .page-desc {
+    margin: 0;
+    color: #666;
+    font-size: 14px;
+  }
+}
+
+// 消息类型单元格
+.message-type-cell {
+  .message-type-name {
+    font-size: 14px;
+    font-weight: 500;
+    color: #333;
+    margin-bottom: 4px;
+  }
+
+  .message-type-code {
+    font-size: 12px;
+    color: #999;
+    font-family: monospace;
+  }
+}
+</style>

@@ -1,0 +1,958 @@
+<template>
+  <div>
+    <t-card class="list-card-container">
+      <t-row justify="space-between">
+        <div class="left-operation-container">
+          <t-button @click="handleAdd">{{ $t('page.notify_channel.button_add') }}</t-button>
+        </div>
+        <div class="right-operation-container">
+          <t-form ref="form" :data="searchformData" :label-width="80" layout="inline" colon :style="{ marginBottom: '8px' }">
+            <t-form-item :label="$t('page.notify_channel.label_name')" name="name">
+              <t-input v-model="searchformData.name" class="search-input" clearable></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.label_type')" name="type">
+              <t-select v-model="searchformData.type" clearable :style="{ width: '150px' }">
+                <t-option value="dingtalk" :label="$t('page.notify_channel.type_dingtalk')">
+                  {{ $t('page.notify_channel.type_dingtalk') }}
+                </t-option>
+                <t-option value="feishu" :label="$t('page.notify_channel.type_feishu')">
+                  {{ $t('page.notify_channel.type_feishu') }}
+                </t-option>
+                <t-option value="email" :label="$t('page.notify_channel.type_email')">
+                  {{ $t('page.notify_channel.type_email') }}
+                </t-option>
+                <t-option value="serverchan" :label="$t('page.notify_channel.type_serverchan')">
+                  {{ $t('page.notify_channel.type_serverchan') }}
+                </t-option>
+                <t-option value="wechatwork" :label="$t('page.notify_channel.type_wechatwork')">
+                  {{ $t('page.notify_channel.type_wechatwork') }}
+                </t-option>
+                <t-option value="webhook" :label="$t('page.notify_channel.type_webhook')">
+                  {{ $t('page.notify_channel.type_webhook') }}
+                </t-option>
+              </t-select>
+            </t-form-item>
+            <t-form-item>
+              <t-button theme="primary" @click="getList">{{ $t('common.search') }}</t-button>
+            </t-form-item>
+          </t-form>
+        </div>
+      </t-row>
+      <help-block :summary="$t('page.notify_channel.alert_message')" doc="guide/NotifyChannel" />
+      <div class="table-container">
+        <t-table :columns="columns" :data="data" :rowKey="rowKey" :verticalAlign="verticalAlign" :hover="hover"
+          :pagination="pagination" :loading="dataLoading" @page-change="rehandlePageChange" @change="rehandleChange"
+          :headerAffixedTop="true" :headerAffixProps="{ offsetTop: offsetTop, container: getContainer }">
+          <template #type="{ row }">
+            <t-tag v-if="row.type === 'dingtalk'" theme="primary">{{ $t('page.notify_channel.type_dingtalk') }}</t-tag>
+            <t-tag v-else-if="row.type === 'feishu'" theme="success">{{ $t('page.notify_channel.type_feishu') }}</t-tag>
+            <t-tag v-else-if="row.type === 'email'" theme="warning">{{ $t('page.notify_channel.type_email') }}</t-tag>
+            <t-tag v-else-if="row.type === 'serverchan'" theme="danger">{{ $t('page.notify_channel.type_serverchan') }}</t-tag>
+            <t-tag v-else-if="row.type === 'wechatwork'" theme="primary">{{ $t('page.notify_channel.type_wechatwork') }}</t-tag>
+            <t-tag v-else-if="row.type === 'webhook'" theme="success">{{ $t('page.notify_channel.type_webhook') }}</t-tag>
+            <t-tag v-else theme="default">{{ row.type }}</t-tag>
+          </template>
+          <template #status="{ row }">
+            <t-switch v-model="row.status" :customValue="[1, 0]" @change="handleStatusChange(row)"></t-switch>
+          </template>
+          <template #op="slotProps">
+            <a class="t-button-link" @click="handleTest(slotProps)">{{ $t('page.notify_channel.button_test') }}</a>
+            <a class="t-button-link" @click="handleClickEdit(slotProps)">{{ $t('common.edit') }}</a>
+            <a class="t-button-link" @click="handleClickDelete(slotProps)">{{ $t('common.delete') }}</a>
+          </template>
+        </t-table>
+      </div>
+    </t-card>
+
+    <!-- 添加对话框 -->
+    <t-dialog :header="$t('common.new')" :visible.sync="addFormVisible" :width="680" :footer="false">
+      <div slot="body">
+        <!-- autocomplete 必须显式关掉。
+             浏览器看到「文本框 + 紧跟着的密码框」就认定这是登录表单，会把保存的
+             **管理端 admin 账号密码**填进渠道名称与密钥；用户不留神点了确定，
+             就把管理员口令当成机器人密钥存进了库。
+             Chrome 只认 new-password（off 对密码框无效），所以两个都得给。 -->
+        <t-form :data="formData" ref="form" :rules="rules" @submit="onSubmit" :labelWidth="120" autocomplete="off">
+          <t-form-item :label="$t('page.notify_channel.label_name')" name="name">
+            <t-input :style="{ width: '480px' }" v-model="formData.name" :placeholder="$t('page.notify_channel.name_placeholder')" autocomplete="off"></t-input>
+          </t-form-item>
+          <t-form-item :label="$t('page.notify_channel.label_type')" name="type">
+            <t-select v-model="formData.type" :style="{ width: '480px' }" @change="handleTypeChange">
+              <t-option value="dingtalk" :label="$t('page.notify_channel.type_dingtalk')"></t-option>
+              <t-option value="feishu" :label="$t('page.notify_channel.type_feishu')"></t-option>
+              <t-option value="email" :label="$t('page.notify_channel.type_email')"></t-option>
+              <t-option value="serverchan" :label="$t('page.notify_channel.type_serverchan')"></t-option>
+              <t-option value="wechatwork" :label="$t('page.notify_channel.type_wechatwork')"></t-option>
+              <t-option value="webhook" :label="$t('page.notify_channel.type_webhook')"></t-option>
+            </t-select>
+          </t-form-item>
+
+          <!-- 通用 Webhook 配置 -->
+          <webhook-config v-if="formData.type === 'webhook'" :form="formData"></webhook-config>
+
+          <!-- 钉钉、飞书和企业微信配置 -->
+          <template v-if="formData.type === 'dingtalk' || formData.type === 'feishu' || formData.type === 'wechatwork'">
+            <t-form-item :label="$t('page.notify_channel.label_webhook_url')" name="webhook_url">
+              <t-input :style="{ width: '480px' }" v-model="formData.webhook_url" :placeholder="$t('page.notify_channel.webhook_placeholder')"></t-input>
+            </t-form-item>
+            <t-form-item v-if="formData.type !== 'wechatwork'" :label="$t('page.notify_channel.label_secret')" name="secret">
+              <t-input :style="{ width: '480px' }" v-model="formData.secret" type="password" :placeholder="$t('page.notify_channel.secret_placeholder')" autocomplete="new-password"></t-input>
+            </t-form-item>
+            <t-alert v-if="formData.type === 'wechatwork'" theme="info" style="margin-top: 12px;">
+              <div style="line-height: 1.8;">
+                <div style="font-weight: bold; margin-bottom: 8px;">📝 如何获取企业微信机器人Webhook：</div>
+                <div style="font-size: 12px; color: #666;">
+                  <div>1. 在企业微信群聊中，点击右上角「···」→「添加群机器人」</div>
+                  <div>2. 选择「新创建一个机器人」，设置机器人名称和头像</div>
+                  <div>3. 复制生成的Webhook地址到上方输入框</div>
+                  <div style="margin-top: 8px; color: #e37318;">💡 提示：企业微信机器人无需配置密钥</div>
+                </div>
+              </div>
+            </t-alert>
+          </template>
+          
+          <!-- Server酱配置 -->
+          <template v-if="formData.type === 'serverchan'">
+            <t-alert theme="info" :message="$t('page.notify_channel.serverchan_config_tip')" style="margin-bottom: 16px;"></t-alert>
+            
+            <t-form-item :label="$t('page.notify_channel.serverchan_sendkey')" name="access_token">
+              <t-input :style="{ width: '480px' }" v-model="formData.access_token" :placeholder="$t('page.notify_channel.serverchan_sendkey_placeholder')"></t-input>
+            </t-form-item>
+            
+            <t-alert theme="warning" style="margin-top: 12px;">
+              <div style="line-height: 1.8;">
+                <div style="font-weight: bold; margin-bottom: 8px;">📝 如何获取SendKey：</div>
+                <div style="font-size: 12px; color: #666;">
+                  <div>1. 访问 <a href="https://sct.ftqq.com/" target="_blank" rel="noopener noreferrer" style="color: #0052d9;">Server酱官网</a> 并使用微信扫码登录</div>
+                  <div>2. 在控制台页面复制您的SendKey</div>
+                  <div>3. 在"消息通道"页面配置接收通知的平台（微信、企业微信、钉钉等）</div>
+                  <div style="margin-top: 8px; color: #e37318;">💡 提示：支持标准格式(SCT开头)和sctp私有部署格式</div>
+                </div>
+              </div>
+            </t-alert>
+          </template>
+          
+          <!-- 邮件配置 -->
+          <template v-if="formData.type === 'email'">
+            <t-alert theme="info" :message="$t('page.notify_channel.email_config_tip')" style="margin-bottom: 16px;"></t-alert>
+            
+            <!-- 常见邮箱配置参考 -->
+            <t-collapse :default-value="[]" style="margin-bottom: 16px;">
+              <t-collapse-panel :header="$t('page.notify_channel.email_common_config')" value="common">
+                <div style="line-height: 1.8;">
+                  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">⭐ QQ邮箱 (推荐)</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.qq.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                        <div>密码: 授权码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">163邮箱</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.163.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                        <div>密码: 授权码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">126邮箱</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.126.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                        <div>密码: 授权码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">⭐ Gmail</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.gmail.com</code></div>
+                        <div>端口: <code>587</code> | 加密: <strong>STARTTLS</strong></div>
+                        <div>密码: 应用专用密码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">Outlook/Hotmail</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.office365.com</code></div>
+                        <div>端口: <code>587</code> | 加密: <strong>STARTTLS</strong></div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">阿里云邮箱</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.aliyun.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style="margin-top: 16px; padding: 10px; background: #fff3e0; border-left: 3px solid #ff9800; border-radius: 4px;">
+                    <div style="color: #e65100; font-weight: bold; margin-bottom: 8px;">⚠️ 重要提示：</div>
+                    <div style="color: #666; font-size: 12px; line-height: 1.8;">
+                      <div>• 大多数邮箱需要先开启SMTP服务并生成<strong style="color: #d32f2f;">授权码</strong>（不是登录密码）</div>
+                      <div>• <strong>QQ/163邮箱</strong>：网页版邮箱 → 设置 → 账户 → POP3/SMTP/IMAP → 开启服务 → 生成授权码</div>
+                      <div>• <strong>Gmail</strong>：Google账户 → 安全性 → 两步验证（必须开启）→ 应用专用密码</div>
+                      <div style="margin-top: 6px; color: #2196f3;">💡 推荐配置：<strong>端口465+SSL/TLS</strong> 或 <strong>端口587+STARTTLS</strong></div>
+                    </div>
+                  </div>
+                </div>
+              </t-collapse-panel>
+            </t-collapse>
+            
+            <t-form-item :label="$t('page.notify_channel.email_smtp_host')" name="email_smtp_host">
+              <t-input :style="{ width: '480px' }" v-model="formData.email_smtp_host" :placeholder="$t('page.notify_channel.email_smtp_host_placeholder')"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_smtp_port')" name="email_smtp_port">
+              <t-input :style="{ width: '480px' }" v-model="formData.email_smtp_port" :placeholder="$t('page.notify_channel.email_smtp_port_placeholder')"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_username')" name="email_username">
+              <t-input :style="{ width: '480px' }" v-model="formData.email_username" :placeholder="$t('page.notify_channel.email_username_placeholder')" autocomplete="off"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_password')" name="email_password">
+              <t-input :style="{ width: '480px' }" v-model="formData.email_password" type="password" :placeholder="$t('page.notify_channel.email_password_placeholder')" autocomplete="new-password"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_from')" name="email_from">
+              <t-input :style="{ width: '480px' }" v-model="formData.email_from" :placeholder="$t('page.notify_channel.email_from_placeholder')"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_from_name')" name="email_from_name">
+              <t-input :style="{ width: '480px' }" v-model="formData.email_from_name" :placeholder="$t('page.notify_channel.email_from_name_placeholder')"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_to')" name="email_to">
+              <t-input :style="{ width: '480px' }" v-model="formData.email_to" :placeholder="$t('page.notify_channel.email_to_placeholder')"></t-input>
+              <div style="font-size: 12px; color: #666; margin-top: 4px;">
+                💡 <b>默认收件人</b>，订阅时可针对消息类型单独配置，未配置则使用此默认值
+              </div>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_ssl_mode')" name="email_ssl_mode">
+              <t-radio-group v-model="formData.email_ssl_mode">
+                <t-radio value="none">{{ $t('page.notify_channel.email_ssl_none') }}</t-radio>
+                <t-radio value="ssl">{{ $t('page.notify_channel.email_ssl_ssl') }}</t-radio>
+                <t-radio value="starttls">{{ $t('page.notify_channel.email_ssl_starttls') }}</t-radio>
+              </t-radio-group>
+            </t-form-item>
+            <t-form-item v-if="formData.email_ssl_mode !== 'none'" :label="$t('page.notify_channel.email_skip_verify')" name="email_skip_verify">
+              <div :style="{ width: '480px' }">
+                <t-checkbox v-model="formData.email_skip_verify" class="skip-verify-checkbox">{{ $t('page.notify_channel.email_skip_verify_label') }}</t-checkbox>
+                <div style="font-size: 12px; color: #666; margin-top: 4px; line-height: 1.5;">
+                  ⚠️ {{ $t('page.notify_channel.email_skip_verify_tip') }}
+                </div>
+              </div>
+            </t-form-item>
+          </template>
+          <t-form-item :label="$t('page.notify_channel.label_status')" name="status">
+            <t-radio-group v-model="formData.status">
+              <t-radio :value="1">{{ $t('common.on') }}</t-radio>
+              <t-radio :value="0">{{ $t('common.off') }}</t-radio>
+            </t-radio-group>
+          </t-form-item>
+          <t-form-item :label="$t('common.remarks')" name="remarks">
+            <t-textarea :style="{ width: '480px' }" v-model="formData.remarks" :rows="3"></t-textarea>
+          </t-form-item>
+          <t-form-item style="float: right">
+            <t-button variant="outline" @click="onClickCloseBtn">{{ $t('common.close') }}</t-button>
+            <t-button theme="primary" type="submit">{{ $t('common.confirm') }}</t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+    </t-dialog>
+
+    <!-- 编辑对话框 -->
+    <t-dialog :header="$t('common.edit')" :visible.sync="editFormVisible" :width="680" :footer="false">
+      <div slot="body">
+        <!-- autocomplete 关闭原因见新增弹窗上方注释 -->
+        <t-form :data="formEditData" ref="formEdit" :rules="rules" @submit="onSubmitEdit" :labelWidth="120" autocomplete="off">
+          <t-form-item :label="$t('page.notify_channel.label_name')" name="name">
+            <t-input :style="{ width: '480px' }" v-model="formEditData.name" autocomplete="off"></t-input>
+          </t-form-item>
+          <t-form-item :label="$t('page.notify_channel.label_type')" name="type">
+            <t-select v-model="formEditData.type" :style="{ width: '480px' }" @change="handleEditTypeChange">
+              <t-option value="dingtalk" :label="$t('page.notify_channel.type_dingtalk')"></t-option>
+              <t-option value="feishu" :label="$t('page.notify_channel.type_feishu')"></t-option>
+              <t-option value="email" :label="$t('page.notify_channel.type_email')"></t-option>
+              <t-option value="serverchan" :label="$t('page.notify_channel.type_serverchan')"></t-option>
+              <t-option value="wechatwork" :label="$t('page.notify_channel.type_wechatwork')"></t-option>
+              <t-option value="webhook" :label="$t('page.notify_channel.type_webhook')"></t-option>
+            </t-select>
+          </t-form-item>
+
+          <!-- 通用 Webhook 配置 -->
+          <webhook-config v-if="formEditData.type === 'webhook'" :form="formEditData"></webhook-config>
+
+          <!-- 钉钉、飞书和企业微信配置 -->
+          <template v-if="formEditData.type === 'dingtalk' || formEditData.type === 'feishu' || formEditData.type === 'wechatwork'">
+            <t-form-item :label="$t('page.notify_channel.label_webhook_url')" name="webhook_url">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.webhook_url"></t-input>
+            </t-form-item>
+            <t-form-item v-if="formEditData.type !== 'wechatwork'" :label="$t('page.notify_channel.label_secret')" name="secret">
+              <t-input
+                :style="{ width: '480px' }"
+                v-model="formEditData.secret"
+                type="password"
+                autocomplete="new-password"
+                :placeholder="
+                  formEditData.has_secret
+                    ? $t('page.notify_channel.secret_set_placeholder')
+                    : $t('page.notify_channel.secret_placeholder')
+                "
+              ></t-input>
+              <div v-if="formEditData.has_secret" class="notify-secret-tip">
+                {{ $t('page.notify_channel.secret_keep_tip') }}
+              </div>
+            </t-form-item>
+            <t-alert v-if="formEditData.type === 'wechatwork'" theme="info" style="margin-top: 12px;">
+              <div style="line-height: 1.8;">
+                <div style="font-weight: bold; margin-bottom: 8px;">📝 如何获取企业微信机器人Webhook：</div>
+                <div style="font-size: 12px; color: #666;">
+                  <div>1. 在企业微信群聊中，点击右上角「···」→「添加群机器人」</div>
+                  <div>2. 选择「新创建一个机器人」，设置机器人名称和头像</div>
+                  <div>3. 复制生成的Webhook地址到上方输入框</div>
+                  <div style="margin-top: 8px; color: #e37318;">💡 提示：企业微信机器人无需配置密钥</div>
+                </div>
+              </div>
+            </t-alert>
+          </template>
+          
+          <!-- Server酱配置 -->
+          <template v-if="formEditData.type === 'serverchan'">
+            <t-alert theme="info" :message="$t('page.notify_channel.serverchan_config_tip')" style="margin-bottom: 16px;"></t-alert>
+            
+            <t-form-item :label="$t('page.notify_channel.serverchan_sendkey')" name="access_token">
+              <t-input
+                :style="{ width: '480px' }"
+                v-model="formEditData.access_token"
+                type="password"
+                autocomplete="new-password"
+                :placeholder="
+                  formEditData.has_access_token
+                    ? $t('page.notify_channel.secret_set_placeholder')
+                    : $t('page.notify_channel.serverchan_sendkey_placeholder')
+                "
+              ></t-input>
+              <div v-if="formEditData.has_access_token" class="notify-secret-tip">
+                {{ $t('page.notify_channel.secret_keep_tip') }}
+              </div>
+            </t-form-item>
+            
+            <t-alert theme="warning" style="margin-top: 12px;">
+              <div style="line-height: 1.8;">
+                <div style="font-weight: bold; margin-bottom: 8px;">📝 如何获取SendKey：</div>
+                <div style="font-size: 12px; color: #666;">
+                  <div>1. 访问 <a href="https://sct.ftqq.com/" target="_blank" rel="noopener noreferrer" style="color: #0052d9;">Server酱官网</a> 并使用微信扫码登录</div>
+                  <div>2. 在控制台页面复制您的SendKey</div>
+                  <div>3. 在"消息通道"页面配置接收通知的平台（微信、企业微信、钉钉等）</div>
+                  <div style="margin-top: 8px; color: #e37318;">💡 提示：支持标准格式(SCT开头)和sctp私有部署格式</div>
+                </div>
+              </div>
+            </t-alert>
+          </template>
+          
+          <!-- 邮件配置 -->
+          <template v-if="formEditData.type === 'email'">
+            <t-alert theme="info" :message="$t('page.notify_channel.email_config_tip')" style="margin-bottom: 16px;"></t-alert>
+            
+            <!-- 常见邮箱配置参考 -->
+            <t-collapse :default-value="[]" style="margin-bottom: 16px;">
+              <t-collapse-panel :header="$t('page.notify_channel.email_common_config')" value="common">
+                <div style="line-height: 1.8;">
+                  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">⭐ QQ邮箱 (推荐)</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.qq.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                        <div>密码: 授权码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">163邮箱</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.163.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                        <div>密码: 授权码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">126邮箱</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.126.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                        <div>密码: 授权码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">⭐ Gmail</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.gmail.com</code></div>
+                        <div>端口: <code>587</code> | 加密: <strong>STARTTLS</strong></div>
+                        <div>密码: 应用专用密码</div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">Outlook/Hotmail</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.office365.com</code></div>
+                        <div>端口: <code>587</code> | 加密: <strong>STARTTLS</strong></div>
+                      </div>
+                    </div>
+                    <div style="padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                      <div style="color: #1976d2; font-weight: bold; margin-bottom: 4px;">阿里云邮箱</div>
+                      <div style="font-size: 12px; color: #666;">
+                        <div>SMTP: <code>smtp.aliyun.com</code></div>
+                        <div>端口: <code>465</code> | 加密: <strong>SSL/TLS</strong></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style="margin-top: 16px; padding: 10px; background: #fff3e0; border-left: 3px solid #ff9800; border-radius: 4px;">
+                    <div style="color: #e65100; font-weight: bold; margin-bottom: 8px;">⚠️ 重要提示：</div>
+                    <div style="color: #666; font-size: 12px; line-height: 1.8;">
+                      <div>• 大多数邮箱需要先开启SMTP服务并生成<strong style="color: #d32f2f;">授权码</strong>（不是登录密码）</div>
+                      <div>• <strong>QQ/163邮箱</strong>：网页版邮箱 → 设置 → 账户 → POP3/SMTP/IMAP → 开启服务 → 生成授权码</div>
+                      <div>• <strong>Gmail</strong>：Google账户 → 安全性 → 两步验证（必须开启）→ 应用专用密码</div>
+                      <div style="margin-top: 6px; color: #2196f3;">💡 推荐配置：<strong>端口465+SSL/TLS</strong> 或 <strong>端口587+STARTTLS</strong></div>
+                    </div>
+                  </div>
+                </div>
+              </t-collapse-panel>
+            </t-collapse>
+            
+            <t-form-item :label="$t('page.notify_channel.email_smtp_host')" name="email_smtp_host">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.email_smtp_host"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_smtp_port')" name="email_smtp_port">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.email_smtp_port"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_username')" name="email_username">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.email_username" autocomplete="off"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_password')" name="email_password">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.email_password" type="password" autocomplete="new-password"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_from')" name="email_from">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.email_from"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_from_name')" name="email_from_name">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.email_from_name"></t-input>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_to')" name="email_to">
+              <t-input :style="{ width: '480px' }" v-model="formEditData.email_to"></t-input>
+              <div style="font-size: 12px; color: #666; margin-top: 4px;">
+                💡 <b>默认收件人</b>，订阅时可针对消息类型单独配置，未配置则使用此默认值
+              </div>
+            </t-form-item>
+            <t-form-item :label="$t('page.notify_channel.email_ssl_mode')" name="email_ssl_mode">
+              <t-radio-group v-model="formEditData.email_ssl_mode">
+                <t-radio value="none">{{ $t('page.notify_channel.email_ssl_none') }}</t-radio>
+                <t-radio value="ssl">{{ $t('page.notify_channel.email_ssl_ssl') }}</t-radio>
+                <t-radio value="starttls">{{ $t('page.notify_channel.email_ssl_starttls') }}</t-radio>
+              </t-radio-group>
+            </t-form-item>
+            <t-form-item v-if="formEditData.email_ssl_mode !== 'none'" :label="$t('page.notify_channel.email_skip_verify')" name="email_skip_verify">
+              <div :style="{ width: '480px' }">
+                <t-checkbox v-model="formEditData.email_skip_verify" class="skip-verify-checkbox">{{ $t('page.notify_channel.email_skip_verify_label') }}</t-checkbox>
+                <div style="font-size: 12px; color: #666; margin-top: 4px; line-height: 1.5;">
+                  ⚠️ {{ $t('page.notify_channel.email_skip_verify_tip') }}
+                </div>
+              </div>
+            </t-form-item>
+          </template>
+          <t-form-item :label="$t('page.notify_channel.label_status')" name="status">
+            <t-radio-group v-model="formEditData.status">
+              <t-radio :value="1">{{ $t('common.on') }}</t-radio>
+              <t-radio :value="0">{{ $t('common.off') }}</t-radio>
+            </t-radio-group>
+          </t-form-item>
+          <t-form-item :label="$t('common.remarks')" name="remarks">
+            <t-textarea :style="{ width: '480px' }" v-model="formEditData.remarks" :rows="3"></t-textarea>
+          </t-form-item>
+          <t-form-item style="float: right">
+            <t-button variant="outline" @click="onClickCloseEditBtn">{{ $t('common.close') }}</t-button>
+            <t-button theme="primary" type="submit">{{ $t('common.confirm') }}</t-button>
+          </t-form-item>
+        </t-form>
+      </div>
+    </t-dialog>
+
+    <!-- 删除确认对话框 -->
+    <t-dialog :header="$t('common.confirm_delete')" :body="confirmBody" :visible.sync="confirmVisible" @confirm="onConfirmDelete" :onCancel="onCancel">
+    </t-dialog>
+  </div>
+</template>
+
+<script lang="ts">
+import Vue from 'vue';
+import { MessagePlugin } from 'tdesign-vue';
+import {
+  getNotifyChannelList,
+  addNotifyChannel,
+  editNotifyChannel,
+  deleteNotifyChannel,
+  testNotifyChannel,
+} from '@/apis/notify_channel';
+import WebhookConfig from './components/WebhookConfig.vue';
+
+// 与后端 waf_service.ConfigClearSentinel 约定：编辑时密钥字段留空=保持原值
+// （后端不回显原文，空提交不能当成清空），要真正清空必须提交这个哨兵值。
+const SECRET_CLEAR_SENTINEL = '__SAMWAF_CLEAR__';
+
+const INITIAL_DATA = {
+  name: '',
+  type: 'dingtalk',
+  webhook_url: '',
+  secret: '',
+  access_token: '',
+  // 后端脱敏后回传的“是否已配置”标记（列表/详情都带），用于编辑时提示与占位符
+  has_secret: false,
+  has_access_token: false,
+  config_json: '',
+  status: 1,
+  remarks: '',
+  // 邮件配置字段
+  email_smtp_host: '',
+  email_smtp_port: '25',
+  email_username: '',
+  email_password: '',
+  email_from: '',
+  email_from_name: '',
+  email_to: '',
+  email_ssl_mode: 'none',
+  email_skip_verify: false,
+  // 通用Webhook配置字段
+  webhook_preset: 'custom',
+  webhook_method: 'POST',
+  webhook_content_type: 'application/json',
+  webhook_headers: [],
+  webhook_body_template: '',
+};
+
+// 每次都要新建一份：webhook_headers 是数组，浅拷贝会让新增和编辑两个表单共用同一个数组
+const newFormData = () => ({ ...INITIAL_DATA, webhook_headers: [] });
+
+// 各渠道类型真正会用到的密钥字段：
+//   secret       —— 钉钉/飞书的签名密钥（企业微信不需要）
+//   access_token —— Server酱的 SendKey
+// 其余类型用不到的字段，编辑保存时要显式清空，避免换过类型后旧密钥滞留在库里。
+const TYPES_USING_SECRET = ['dingtalk', 'feishu'];
+const TYPES_USING_ACCESS_TOKEN = ['serverchan'];
+
+// normalizeSecretsForEdit 编辑提交前归一密钥字段（就地修改 submitData）：
+// 本类型使用的字段留空即可（后端理解为"保持原值"）；用不到的字段发哨兵值真正清空。
+const normalizeSecretsForEdit = (submitData: any) => {
+  if (!TYPES_USING_SECRET.includes(submitData.type)) {
+    submitData.secret = SECRET_CLEAR_SENTINEL;
+  }
+  if (!TYPES_USING_ACCESS_TOKEN.includes(submitData.type)) {
+    submitData.access_token = SECRET_CLEAR_SENTINEL;
+  }
+};
+
+// buildWebhookConfig 把表单字段拼成后端 wafnotify/webhook.Config 的 JSON
+const buildWebhookConfig = (form: any) => JSON.stringify({
+  url: (form.webhook_url || '').trim(),
+  method: form.webhook_method || 'POST',
+  content_type: form.webhook_content_type || 'application/json',
+  headers: (form.webhook_headers || [])
+    .filter((h: any) => (h.key || '').trim() !== '')
+    .map((h: any) => ({ key: (h.key || '').trim(), value: (h.value || '').trim() })),
+  body_template: form.webhook_body_template || '',
+});
+
+export default Vue.extend({
+  name: 'NotifyChannel',
+  components: { WebhookConfig },
+  data() {
+    return {
+      data: [],
+      dataLoading: false,
+      value: 'first',
+      columns: [
+        { colKey: 'row-select', type: 'multiple', width: 50, fixed: 'left' },
+        { title: this.$t('page.notify_channel.label_name'), colKey: 'name', width: 150 },
+        { title: this.$t('page.notify_channel.label_type'), colKey: 'type', width: 120 },
+        { title: this.$t('page.notify_channel.label_webhook_url'), colKey: 'webhook_url', ellipsis: true },
+        { title: this.$t('page.notify_channel.label_status'), colKey: 'status', width: 100 },
+        { title: this.$t('common.remarks'), colKey: 'remarks', ellipsis: true, width: 200 },
+        { title: this.$t('common.create_time'), colKey: 'create_time', width: 180 },
+        {
+          align: 'left',
+          fixed: 'right',
+          width: 200,
+          colKey: 'op',
+          title: this.$t('common.op'),
+        },
+      ],
+      rowKey: 'id',
+      verticalAlign: 'top',
+      hover: true,
+      pagination: {
+        pageSize: 20,
+        total: 0,
+        current: 1,
+      },
+      searchformData: {
+        pageIndex: 1,
+        pageSize: 20,
+        name: '',
+        type: '',
+      },
+      formData: newFormData(),
+      formEditData: newFormData(),
+      rules: {
+        name: [{ required: true, message: this.$t('common.required'), type: 'error' }],
+        type: [{ required: true, message: this.$t('common.required'), type: 'error' }],
+        webhook_url: [{ required: true, message: this.$t('common.required'), type: 'error' }],
+      },
+      addFormVisible: false,
+      editFormVisible: false,
+      confirmVisible: false,
+      confirmBody: '',
+      offsetTop: 0,
+    };
+  },
+  computed: {},
+  mounted() {
+    this.getList();
+  },
+  methods: {
+    getContainer() {
+      return document.querySelector('.tdesign-starter-main');
+    },
+    async getList() {
+      this.dataLoading = true;
+      try {
+        const res = await getNotifyChannelList(this.searchformData);
+        if (res.code === 0) {
+          this.data = res.data.list || [];
+          this.pagination.total = res.data.total;
+          this.pagination.current = this.searchformData.pageIndex;
+          this.pagination.pageSize = this.searchformData.pageSize;
+        }
+      } catch (e) {
+        console.error(e);
+      } finally {
+        this.dataLoading = false;
+      }
+    },
+    rehandlePageChange(pageInfo: any) {
+      this.searchformData.pageIndex = pageInfo.current;
+      this.searchformData.pageSize = pageInfo.pageSize;
+      this.getList();
+    },
+    rehandleChange(changeParams: any, triggerAndData: any) {
+      console.log('统一Change', changeParams, triggerAndData);
+    },
+    handleAdd() {
+      this.formData = newFormData();
+      this.addFormVisible = true;
+    },
+    handleClickEdit(e: any) {
+      const row = { ...newFormData(), ...e.row };
+      // 如果是通用Webhook类型，解析config_json
+      if (row.type === 'webhook' && row.config_json) {
+        try {
+          const config = JSON.parse(row.config_json);
+          row.webhook_url = config.url || row.webhook_url || '';
+          row.webhook_method = config.method || 'POST';
+          row.webhook_content_type = config.content_type || 'application/json';
+          row.webhook_headers = Array.isArray(config.headers)
+            ? config.headers.map((h: any) => ({ key: h.key || '', value: h.value || '' }))
+            : [];
+          row.webhook_body_template = config.body_template || '';
+          row.webhook_preset = 'custom';
+        } catch (err) {
+          console.error('解析Webhook配置失败', err);
+        }
+      }
+      // 如果是邮件类型，解析config_json
+      if (row.type === 'email' && row.config_json) {
+        try {
+          const config = JSON.parse(row.config_json);
+          row.email_smtp_host = config.smtp_host || '';
+          row.email_smtp_port = config.smtp_port || '25';
+          row.email_username = config.username || '';
+          row.email_password = config.password || '';
+          row.email_from = config.from_email || '';
+          row.email_from_name = config.from_name || '';
+          row.email_to = (config.to_emails || []).join(',');
+          row.email_ssl_mode = config.enable_ssl ? 'ssl' : (config.enable_starttls ? 'starttls' : 'none');
+          row.email_skip_verify = config.skip_verify || false;
+        } catch (e) {
+          console.error('解析邮件配置失败', e);
+        }
+      }
+      // 密钥字段后端已不回显（列表只带 has_secret / has_access_token），
+      // 这里再显式清一次，确保输入框永远从空开始：留空提交=保持原值。
+      row.secret = '';
+      row.access_token = '';
+      this.formEditData = row;
+      this.editFormVisible = true;
+    },
+    handleClickDelete(e: any) {
+      this.formEditData = { ...e.row };
+      this.confirmBody = this.$t('page.notify_channel.delete_confirm');
+      this.confirmVisible = true;
+    },
+    async handleTest(e: any) {
+      try {
+        const res = await testNotifyChannel({ id: e.row.id });
+        if (res.code === 0) {
+          MessagePlugin.success(this.$t('page.notify_channel.test_success'));
+        } else {
+          MessagePlugin.error(this.$t('page.notify_channel.test_failed') + ': ' + res.msg);
+        }
+      } catch (error) {
+        MessagePlugin.error(this.$t('page.notify_channel.test_failed'));
+      }
+    },
+    // 只改启用状态：整行回传即可。行里的 secret/access_token 是后端脱敏后的空串，
+    // 按"留空=保持原值"语义不会动到已存密钥（这里不能走 normalizeSecretsForEdit，
+    // 那是编辑表单换类型时才需要的显式清空）。
+    async handleStatusChange(row: any) {
+      try {
+        const res = await editNotifyChannel(row);
+        if (res.code === 0) {
+          MessagePlugin.success(this.$t('common.tips.save_success'));
+        } else {
+          row.status = row.status === 1 ? 0 : 1;
+          MessagePlugin.error(this.$t('common.tips.save_failed'));
+        }
+      } catch (error) {
+        row.status = row.status === 1 ? 0 : 1;
+        MessagePlugin.error(this.$t('common.tips.save_failed'));
+      }
+    },
+    async onSubmit({ validateResult, firstError }: any) {
+      if (validateResult === true) {
+        try {
+          const submitData = { ...this.formData };
+          // 如果是邮件类型，构建config_json
+          if (submitData.type === 'email') {
+            const emailConfig = {
+              smtp_host: submitData.email_smtp_host,
+              smtp_port: submitData.email_smtp_port,
+              username: submitData.email_username,
+              password: submitData.email_password,
+              from_email: submitData.email_from,
+              from_name: submitData.email_from_name,
+              to_emails: submitData.email_to.split(',').map((email: string) => email.trim()),
+              enable_ssl: submitData.email_ssl_mode === 'ssl',
+              enable_starttls: submitData.email_ssl_mode === 'starttls',
+              skip_verify: submitData.email_ssl_mode !== 'none' && !!submitData.email_skip_verify,
+            };
+            submitData.config_json = JSON.stringify(emailConfig);
+            // 清空webhook_url和secret字段
+            submitData.webhook_url = '';
+            submitData.secret = '';
+          } else if (submitData.type === 'serverchan') {
+            // Server酱使用access_token存储SendKey
+            // 清空webhook_url和secret字段
+            submitData.webhook_url = '';
+            submitData.secret = '';
+            submitData.config_json = '';
+          } else if (submitData.type === 'webhook') {
+            // 地址同时写进 webhook_url 列，列表页那一列才有内容可展示
+            submitData.webhook_url = (submitData.webhook_url || '').trim();
+            submitData.secret = '';
+            submitData.access_token = '';
+            submitData.config_json = buildWebhookConfig(submitData);
+          }
+          const res = await addNotifyChannel(submitData);
+          if (res.code === 0) {
+            MessagePlugin.success(this.$t('page.notify_channel.add_success'));
+            this.addFormVisible = false;
+            this.getList();
+          } else {
+            MessagePlugin.error(res.msg || this.$t('page.notify_channel.add_failed'));
+          }
+        } catch (error) {
+          MessagePlugin.error(this.$t('page.notify_channel.add_failed'));
+        }
+      } else {
+        MessagePlugin.warning(firstError);
+      }
+    },
+    async onSubmitEdit({ validateResult, firstError }: any) {
+      if (validateResult === true) {
+        try {
+          const submitData = { ...this.formEditData };
+          // 如果是邮件类型，构建config_json
+          if (submitData.type === 'email') {
+            const emailConfig = {
+              smtp_host: submitData.email_smtp_host,
+              smtp_port: submitData.email_smtp_port,
+              username: submitData.email_username,
+              password: submitData.email_password,
+              from_email: submitData.email_from,
+              from_name: submitData.email_from_name,
+              to_emails: submitData.email_to.split(',').map((email: string) => email.trim()),
+              enable_ssl: submitData.email_ssl_mode === 'ssl',
+              enable_starttls: submitData.email_ssl_mode === 'starttls',
+              skip_verify: submitData.email_ssl_mode !== 'none' && !!submitData.email_skip_verify,
+            };
+            submitData.config_json = JSON.stringify(emailConfig);
+            submitData.webhook_url = '';
+          } else if (submitData.type === 'serverchan') {
+            // Server酱使用access_token存储SendKey
+            submitData.webhook_url = '';
+            submitData.config_json = '';
+          } else if (submitData.type === 'webhook') {
+            // 地址同时写进 webhook_url 列，列表页那一列才有内容可展示
+            submitData.webhook_url = (submitData.webhook_url || '').trim();
+            submitData.config_json = buildWebhookConfig(submitData);
+          }
+          // 密钥字段归一（编辑专用）：本类型用不到的密钥必须显式清空。
+          // 后端语义是"留空=保持原值"（因为不回显原文），所以这里不能只置空串，
+          // 否则改成别的渠道类型后，旧密钥会一直留在库里。
+          normalizeSecretsForEdit(submitData);
+          const res = await editNotifyChannel(submitData);
+          if (res.code === 0) {
+            MessagePlugin.success(this.$t('page.notify_channel.edit_success'));
+            this.editFormVisible = false;
+            this.getList();
+          } else {
+            MessagePlugin.error(res.msg || this.$t('page.notify_channel.edit_failed'));
+          }
+        } catch (error) {
+          MessagePlugin.error(this.$t('page.notify_channel.edit_failed'));
+        }
+      } else {
+        MessagePlugin.warning(firstError);
+      }
+    },
+    async onConfirmDelete() {
+      try {
+        const res = await deleteNotifyChannel({ id: this.formEditData.id });
+        if (res.code === 0) {
+          MessagePlugin.success(this.$t('page.notify_channel.delete_success'));
+          this.confirmVisible = false;
+          this.getList();
+        } else {
+          MessagePlugin.error(res.msg || this.$t('page.notify_channel.delete_failed'));
+        }
+      } catch (error) {
+        MessagePlugin.error(this.$t('page.notify_channel.delete_failed'));
+      }
+    },
+    onCancel() {
+      this.confirmVisible = false;
+    },
+    onClickCloseBtn() {
+      this.addFormVisible = false;
+    },
+    onClickCloseEditBtn() {
+      this.editFormVisible = false;
+    },
+    handleTypeChange(value: string) {
+      // 切换类型时清空相关字段
+      if (value === 'email') {
+        this.formData.webhook_url = '';
+        this.formData.secret = '';
+        this.formData.access_token = '';
+      } else if (value === 'serverchan') {
+        this.formData.webhook_url = '';
+        this.formData.secret = '';
+        this.formData.email_smtp_host = '';
+        this.formData.email_smtp_port = '25';
+        this.formData.email_username = '';
+        this.formData.email_password = '';
+        this.formData.email_from = '';
+        this.formData.email_from_name = '';
+        this.formData.email_to = '';
+        this.formData.email_ssl_mode = 'none';
+        this.formData.email_skip_verify = false;
+      } else {
+        this.formData.access_token = '';
+        this.formData.email_smtp_host = '';
+        this.formData.email_smtp_port = '25';
+        this.formData.email_username = '';
+        this.formData.email_password = '';
+        this.formData.email_from = '';
+        this.formData.email_from_name = '';
+        this.formData.email_to = '';
+        this.formData.email_ssl_mode = 'none';
+        this.formData.email_skip_verify = false;
+      }
+    },
+    handleEditTypeChange(value: string) {
+      // 切换类型时清空相关字段
+      if (value === 'email') {
+        this.formEditData.webhook_url = '';
+        this.formEditData.secret = '';
+        this.formEditData.access_token = '';
+      } else if (value === 'serverchan') {
+        this.formEditData.webhook_url = '';
+        this.formEditData.secret = '';
+        this.formEditData.email_smtp_host = '';
+        this.formEditData.email_smtp_port = '25';
+        this.formEditData.email_username = '';
+        this.formEditData.email_password = '';
+        this.formEditData.email_from = '';
+        this.formEditData.email_from_name = '';
+        this.formEditData.email_to = '';
+        this.formEditData.email_ssl_mode = 'none';
+        this.formEditData.email_skip_verify = false;
+      } else {
+        this.formEditData.access_token = '';
+        this.formEditData.email_smtp_host = '';
+        this.formEditData.email_smtp_port = '25';
+        this.formEditData.email_username = '';
+        this.formEditData.email_password = '';
+        this.formEditData.email_from = '';
+        this.formEditData.email_from_name = '';
+        this.formEditData.email_to = '';
+        this.formEditData.email_ssl_mode = 'none';
+        this.formEditData.email_skip_verify = false;
+      }
+    },
+  },
+});
+</script>
+
+<style lang="less" scoped>
+.list-card-container {
+  padding: 16px;
+}
+
+.table-container {
+  margin-top: 16px;
+}
+
+.search-input {
+  width: 200px;
+}
+
+.left-operation-container {
+  .t-button {
+    margin-right: 8px;
+  }
+}
+
+// 防止复选框方块在标签换行时被压扁
+.skip-verify-checkbox {
+  align-items: flex-start;
+
+  /deep/ .t-checkbox__input {
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  /deep/ .t-checkbox__label {
+    line-height: 1.4;
+  }
+}
+</style>
+
+
+
+
+
+<style lang="less">
+/* 弹窗内容会被 TDesign 挂到 body 下，scoped 样式命中不到，这里用全局作用域 */
+.notify-secret-tip {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--td-text-color-placeholder);
+  line-height: 1.5;
+}
+</style>

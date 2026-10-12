@@ -1,0 +1,396 @@
+package api
+
+import (
+	"SamWaf/common/zlog"
+	"SamWaf/enums"
+	"SamWaf/global"
+	"SamWaf/model"
+	"SamWaf/model/common/response"
+	"SamWaf/model/request"
+	"SamWaf/model/spec"
+	"SamWaf/utils"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+type WafSslOrderApi struct {
+}
+
+// AddApi 新建SSL证书申请订单
+// @Summary      新建SSL证书申请订单
+// @Description  向 Let's Encrypt 或 ZeroSSL 发起新的 SSL 证书申请
+// @Tags         SSL证书订单
+// @Accept       json
+// @Produce      json
+// @Param        data  body      request.WafSslorderaddReq  true  "订单配置"
+// @Success      200   {object}  response.Response  "添加成功"
+// @Security     ApiKeyAuth
+// @Router       /wafhost/sslorder/add [post]
+func (w *WafSslOrderApi) AddApi(c *gin.Context) {
+	var req request.WafSslorderaddReq
+	err := c.ShouldBindJSON(&req)
+	if err == nil {
+		if req.ApplyMethod != "dns01" {
+			req.SkipDNSVerify = 0
+		}
+		hostBean := wafHostService.GetDetailByCodeApi(req.HostCode)
+		if hostBean.Id == "" {
+			response.FailWithMessage("查找主机未找到", c)
+			return
+		}
+		//检测80端口是否可用于 http01 文件验证（必须存在且为 HTTP 明文）
+		if req.ApplyMethod == "http01" {
+			if ok, proto := w.check80Port(hostBean); !ok {
+				response.FailWithMessage(http01PortHint(proto), c)
+				return
+			}
+		}
+		//检测是否*的情况
+		if req.ApplyMethod == "http01" && hostBean.Host == "*" {
+			response.FailWithMessage("未指定域名情况不能使用http文件验证方式", c)
+			return
+		}
+		//检测是否是IP地址，IP地址只能使用http01验证方式
+		isIpAddress := utils.IsIP(hostBean.Host)
+		if isIpAddress && req.ApplyMethod != "http01" {
+			response.FailWithMessage("IP证书只支持HTTP文件验证方式(http01)，不支持DNS验证方式", c)
+			return
+		}
+		if req.ApplyPlatform == "zerossl" {
+
+			if global.GCONFIG_ZEROSSL_EAB_KID == "" || global.GCONFIG_ZEROSSL_EAB_HMAC_KEY == "" {
+				if global.GCONFIG_ZEROSSL_ACCESS_KEY == "" {
+					response.FailWithMessage("请配置zerossl访问key,在系统配置中 zerossl_access_key 中配置", c)
+					return
+				}
+				// 调用 ZeroSSL API 获取 EAB 凭证
+				err := w.fetchAndUpdateZeroSSLEABCredentials()
+				if err != nil {
+					response.FailWithMessage(fmt.Sprintf("获取ZeroSSL EAB凭证失败: %s", err.Error()), c)
+					return
+				}
+			}
+		}
+		addResult, err := wafSslOrderService.AddApi(req)
+		if err == nil {
+			w.NotifyWaf(enums.ChanSslOrderSubmitted, addResult)
+			response.OkWithMessage("添加成功", c)
+		} else {
+			response.FailWithMessage("添加失败", c)
+		}
+		return
+
+	} else {
+		response.FailWithMessage("解析失败", c)
+	}
+}
+
+// GetDetailApi 获取SSL证书订单详情
+// @Summary      获取SSL证书订单详情
+// @Description  根据ID获取SSL证书申请订单详情
+// @Tags         SSL证书订单
+// @Accept       json
+// @Produce      json
+// @Param        id  query     string  true  "订单ID"
+// @Success      200  {object}  response.Response  "获取成功"
+// @Security     ApiKeyAuth
+// @Router       /wafhost/sslorder/detail [get]
+func (w *WafSslOrderApi) GetDetailApi(c *gin.Context) {
+	var req request.WafSslorderdetailReq
+	err := c.ShouldBind(&req)
+	if err == nil {
+		bean := wafSslOrderService.GetDetailApi(req)
+		response.OkWithDetailed(bean, "获取成功", c)
+	} else {
+		response.FailWithMessage("解析失败", c)
+	}
+}
+
+// GetListApi 获取SSL证书订单列表
+// @Summary      获取SSL证书订单列表
+// @Description  分页查询SSL证书申请订单列表
+// @Tags         SSL证书订单
+// @Accept       json
+// @Produce      json
+// @Param        data  body      request.WafSslordersearchReq  true  "分页查询参数"
+// @Success      200   {object}  response.Response{data=response.PageResult}  "获取成功"
+// @Security     ApiKeyAuth
+// @Router       /wafhost/sslorder/list [post]
+func (w *WafSslOrderApi) GetListApi(c *gin.Context) {
+	var req request.WafSslordersearchReq
+	err := c.ShouldBindJSON(&req)
+	if err == nil {
+		beans, total, _ := wafSslOrderService.GetListApi(req)
+		response.OkWithDetailed(response.PageResult{
+			List:      beans,
+			Total:     total,
+			PageIndex: req.PageIndex,
+			PageSize:  req.PageSize,
+		}, "获取成功", c)
+	} else {
+		response.FailWithMessage("解析失败", c)
+	}
+}
+
+// DelApi 删除SSL证书订单
+// @Summary      删除SSL证书订单
+// @Description  根据ID删除SSL证书申请订单
+// @Tags         SSL证书订单
+// @Accept       json
+// @Produce      json
+// @Param        id  query     string  true  "订单ID"
+// @Success      200  {object}  response.Response  "删除成功"
+// @Security     ApiKeyAuth
+// @Router       /wafhost/sslorder/del [get]
+func (w *WafSslOrderApi) DelApi(c *gin.Context) {
+	var req request.WafSslorderdeleteReq
+	err := c.ShouldBind(&req)
+	if err == nil {
+		err = wafSslOrderService.DelApi(req)
+		if err != nil && errors.Is(err, gorm.ErrRecordNotFound) {
+			response.FailWithMessage("请检测参数", c)
+		} else if err != nil {
+			response.FailWithMessage("发生错误", c)
+		} else {
+			response.OkWithMessage("删除成功", c)
+		}
+
+	} else {
+		response.FailWithMessage("解析失败", c)
+	}
+}
+
+// ModifyApi 续期SSL证书订单
+// @Summary      续期SSL证书订单
+// @Description  对已成功申请且未过期的证书发起续期申请
+// @Tags         SSL证书订单
+// @Accept       json
+// @Produce      json
+// @Param        data  body      request.WafSslordereditReq  true  "续期配置"
+// @Success      200   {object}  response.Response  "续期成功"
+// @Security     ApiKeyAuth
+// @Router       /wafhost/sslorder/edit [post]
+func (w *WafSslOrderApi) ModifyApi(c *gin.Context) {
+	var req request.WafSslordereditReq
+	err := c.ShouldBindJSON(&req)
+	if err == nil {
+		if req.ApplyMethod != "dns01" {
+			req.SkipDNSVerify = 0
+		}
+		existingOrder := wafSslOrderService.GetDetailById(req.Id)
+		if existingOrder.Id == "" {
+			response.FailWithMessage("SSL订单不存在", c)
+			return
+		}
+
+		if existingOrder.ApplyStatus != "success" {
+			response.FailWithMessage("上次证书申请未成功，无法续期。请点击新建发起申请", c)
+			return
+		}
+		// 续期与申请走同一套挑战：http01 同样要求 80 端口是 HTTP 明文，
+		// 否则每次续期都会在 ACME 侧失败（还会消耗服务商的失败频率配额）
+		if existingOrder.ApplyMethod == "http01" {
+			hostBean := wafHostService.GetDetailByCodeApi(existingOrder.HostCode)
+			if hostBean.Id != "" {
+				if ok, proto := w.check80Port(hostBean); !ok {
+					response.FailWithMessage(http01PortHint(proto), c)
+					return
+				}
+			}
+		}
+		if len(existingOrder.ResultPrivateKey) == 0 || len(existingOrder.ResultCertificate) == 0 {
+			response.FailWithMessage("上次证书未找到，无法续期。请点击新建发起申请", c)
+			return
+		}
+		isExpired, _, _, err := existingOrder.ExpirationMessage()
+		if err != nil {
+			response.FailWithMessage("无法获取证书到期信息："+err.Error()+",请点击新建发起申请", c)
+			return
+		}
+		if isExpired {
+			response.FailWithMessage("证书已过期，无法续期，请点击新建发起申请", c)
+			return
+		}
+
+		err = wafSslOrderService.ModifyApi(req)
+		if err != nil {
+			response.FailWithMessage("续期发生错误", c)
+		} else {
+			//发起续期
+			renewAdd, err := wafSslOrderService.RenewAdd(req.Id)
+			if err == nil {
+				w.NotifyWaf(enums.ChanSslOrderrenew, renewAdd)
+				response.OkWithMessage("续期成功", c)
+			} else {
+				response.FailWithMessage("续期失败", c)
+			}
+		}
+	} else {
+		response.FailWithMessage("续期解析失败", c)
+	}
+}
+
+/*
+*
+发送SSL证书订单通知
+*/
+func (w *WafSslOrderApi) NotifyWaf(chanType int, bean model.SslOrder) {
+	var chanInfo = spec.ChanSslOrder{
+		Type:    chanType,
+		Content: bean,
+	}
+	global.GWAF_CHAN_SSLOrder <- chanInfo
+}
+
+// http01PortHint 按 80 端口的实际状态给出可操作的提示文案。
+func http01PortHint(proto string) string {
+	if proto == utils.ListenProtoHTTPS {
+		return "80端口当前被设置为 HTTPS 协议，而文件验证(http01)需要以明文 HTTP 访问 " +
+			global.GSSL_HTTP_CHANGLE_PATH + " ，验证会失败。请在网站编辑的「监听端口」里把 80 改为 HTTP，或改用 DNS 验证方式"
+	}
+	return "未在主机上找到80端口配置，请在网站编辑的「监听端口」里增加一个协议为 HTTP 的 80 端口，再进行发起"
+}
+
+// check80Port 检测 80 端口能否承载 ACME http01 文件验证。
+// 端口来源统一走监听表（含显式 port_listens_json 与隐式 80）；协议必须是 http：
+// Let's Encrypt/ZeroSSL 是以明文 HTTP 访问 http://域名/.well-known/acme-challenge/ 的，
+// 80 若被声明为 HTTPS，TLS 握手就失败，挑战永远拿不到。
+// 返回 (是否可用于 http01, 该端口当前协议;不存在时为空)
+func (w *WafSslOrderApi) check80Port(hosts model.Hosts) (bool, string) {
+	for _, listen := range utils.ResolveHostListens(hosts) {
+		if listen.Port == 80 {
+			return listen.Protocol == utils.ListenProtoHTTP, listen.Protocol
+		}
+	}
+	return false, ""
+}
+
+// fetchAndUpdateZeroSSLEABCredentials 调用 ZeroSSL API 获取 EAB 凭证并更新配置
+func (w *WafSslOrderApi) fetchAndUpdateZeroSSLEABCredentials() error {
+	// 构建请求 URL
+	apiURL := "https://api.zerossl.com/acme/eab-credentials"
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return fmt.Errorf("解析URL失败: %w", err)
+	}
+
+	// 添加查询参数（GET 请求）
+	q := u.Query()
+	q.Set("access_key", global.GCONFIG_ZEROSSL_ACCESS_KEY)
+	u.RawQuery = q.Encode()
+
+	// 创建 HTTP 客户端
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		},
+	}
+
+	// 发送 POST 请求（URL 中包含查询参数）
+	zlog.Info("调用 ZeroSSL API 获取 EAB 凭证", "url", u.String())
+	req, err := http.NewRequest("POST", u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应体
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	// 检查 HTTP 状态码
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API请求失败，状态码: %d, 响应: %s", resp.StatusCode, string(body))
+	}
+
+	// 解析 JSON 响应
+	var apiResponse struct {
+		Success    bool   `json:"success"`
+		EabKid     string `json:"eab_kid"`
+		EabHmacKey string `json:"eab_hmac_key"`
+		Error      *struct {
+			Code    int    `json:"code"`
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(body, &apiResponse); err != nil {
+		return fmt.Errorf("解析JSON响应失败: %w, 原始响应: %s", err, string(body))
+	}
+
+	// 检查 API 响应是否成功
+	if !apiResponse.Success {
+		errorMsg := string(body)
+		if apiResponse.Error != nil {
+			errorMsg = fmt.Sprintf("错误代码: %d, 类型: %s, 消息: %s",
+				apiResponse.Error.Code, apiResponse.Error.Type, apiResponse.Error.Message)
+		}
+		return fmt.Errorf("API返回失败: %s", errorMsg)
+	}
+
+	// 验证返回的凭证是否有效
+	if apiResponse.EabKid == "" || apiResponse.EabHmacKey == "" {
+		return fmt.Errorf("API返回的凭证为空, 响应: %s", string(body))
+	}
+
+	// 更新全局变量
+	global.GCONFIG_ZEROSSL_EAB_KID = apiResponse.EabKid
+	global.GCONFIG_ZEROSSL_EAB_HMAC_KEY = apiResponse.EabHmacKey
+
+	// 更新数据库配置
+	// 更新 zerossl_eab_kid
+	eabKidConfig := wafSystemConfigService.GetDetailByItemApi(request.WafSystemConfigDetailByItemReq{Item: "zerossl_eab_kid"})
+	if eabKidConfig.Id != "" {
+		err = wafSystemConfigService.ModifyApi(request.WafSystemConfigEditReq{
+			Id:        eabKidConfig.Id,
+			Item:      eabKidConfig.Item,
+			ItemClass: eabKidConfig.ItemClass,
+			Value:     apiResponse.EabKid,
+			Remarks:   eabKidConfig.Remarks,
+			ItemType:  eabKidConfig.ItemType,
+			Options:   eabKidConfig.Options,
+		})
+		if err != nil {
+			zlog.Warn("更新 zerossl_eab_kid 配置失败", "error", err.Error())
+		}
+	}
+
+	// 更新 zerossl_eab_hmac_key
+	eabHmacKeyConfig := wafSystemConfigService.GetDetailByItemApi(request.WafSystemConfigDetailByItemReq{Item: "zerossl_eab_hmac_key"})
+	if eabHmacKeyConfig.Id != "" {
+		err = wafSystemConfigService.ModifyApi(request.WafSystemConfigEditReq{
+			Id:        eabHmacKeyConfig.Id,
+			Item:      eabHmacKeyConfig.Item,
+			ItemClass: eabHmacKeyConfig.ItemClass,
+			Value:     apiResponse.EabHmacKey,
+			Remarks:   eabHmacKeyConfig.Remarks,
+			ItemType:  eabHmacKeyConfig.ItemType,
+			Options:   eabHmacKeyConfig.Options,
+		})
+		if err != nil {
+			zlog.Warn("更新 zerossl_eab_hmac_key 配置失败", "error", err.Error())
+		}
+	}
+
+	zlog.Info("ZeroSSL EAB 凭证获取并更新成功")
+	return nil
+}

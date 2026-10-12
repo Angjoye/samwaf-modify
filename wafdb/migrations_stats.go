@@ -1,0 +1,499 @@
+package wafdb
+
+import (
+	"SamWaf/common/zlog"
+	"SamWaf/model"
+	"fmt"
+	"time"
+
+	"github.com/go-gormigrate/gormigrate/v2"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+// RunStatsDBMigrations 执行统计数据库迁移（完全兼容老用户）
+func RunStatsDBMigrations(db *gorm.DB) error {
+	zlog.Info("开始执行stats数据库迁移检查...")
+
+	// 检测表和索引的存在情况
+	tablesExist := checkStatsTablesExist(db)
+	indexesExist := checkStatsIndexesExist(db)
+
+	zlog.Info("数据库状态检测",
+		"表是否存在", tablesExist,
+		"索引是否完整", indexesExist)
+
+	m := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{
+		// 迁移1: 创建表（如果不存在）
+		{
+			ID: "202511110001_initial_tables",
+			Migrate: func(tx *gorm.DB) error {
+				if tablesExist {
+					zlog.Info("迁移 202511110001: 表已存在，执行结构同步")
+					// 表已存在，只做结构同步（安全操作，不会删除字段/数据）
+					if err := tx.AutoMigrate(
+						&model.StatsTotal{},
+						&model.StatsDay{},
+						&model.StatsIPDay{},
+						&model.StatsIPCityDay{},
+						&model.IPTag{},
+					); err != nil {
+						return fmt.Errorf("同步表结构失败: %w", err)
+					}
+					zlog.Info("表结构同步成功（数据完整保留）")
+				} else {
+					zlog.Info("迁移 202511110001: 创建新表")
+					// 表不存在，创建所有表
+					if err := tx.AutoMigrate(
+						&model.StatsTotal{},
+						&model.StatsDay{},
+						&model.StatsIPDay{},
+						&model.StatsIPCityDay{},
+						&model.IPTag{},
+					); err != nil {
+						return fmt.Errorf("创建stats表失败: %w", err)
+					}
+					zlog.Info("stats表创建成功")
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				if tablesExist {
+					// 如果是老数据库，不执行删除操作（保护数据）
+					zlog.Info("回滚 202511110001: 检测到已存在数据，跳过表删除（保护用户数据）")
+					return nil
+				}
+				// 新数据库可以安全删除
+				zlog.Info("回滚 202511110001: 删除表")
+				return tx.Migrator().DropTable(
+					&model.StatsTotal{},
+					&model.StatsDay{},
+					&model.StatsIPDay{},
+					&model.StatsIPCityDay{},
+					&model.IPTag{},
+				)
+			},
+		},
+		// 迁移1b: 同步 MySQL stats 各表结构（补全缺失列 + 修复 longtext → varchar，支持建索引）
+		{
+			ID: "202511110001b_fix_mysql_varchar",
+			Migrate: func(tx *gorm.DB) error {
+				if tx.Dialector.Name() != "mysql" {
+					return nil
+				}
+				zlog.Info("迁移 202511110001b: 同步 stats 各表结构")
+				if err := tx.AutoMigrate(
+					&model.StatsDay{},
+					&model.StatsIPDay{},
+					&model.StatsIPCityDay{},
+					&model.IPTag{},
+				); err != nil {
+					return fmt.Errorf("同步 stats 表结构失败: %w", err)
+				}
+				zlog.Info("迁移 202511110001b: stats 表结构同步完成")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error { return nil },
+		},
+		// 迁移2: 创建索引（幂等操作）
+		{
+			ID: "202511110002_create_indexes",
+			Migrate: func(tx *gorm.DB) error {
+				if indexesExist {
+					zlog.Info("迁移 202511110002: 索引已完整，跳过创建")
+					return nil
+				}
+				zlog.Info("迁移 202511110002: 开始创建索引")
+				return createStatsIndexes(tx)
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202511110002: 删除索引")
+				return dropStatsIndexes(tx)
+			},
+		},
+		// 迁移3: 创建站点综合统计表（天级+小时级）
+		{
+			ID: "202603100001_create_site_stats_tables",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202603100001: 创建站点综合统计表")
+				if err := tx.AutoMigrate(
+					&model.StatsSiteDay{},
+					&model.StatsSiteHour{},
+				); err != nil {
+					return fmt.Errorf("创建站点统计表失败: %w", err)
+				}
+				zlog.Info("迁移 202603100001: 创建站点统计索引")
+				siteIdxs := []struct{ name, table, sql string }{
+					{
+						"idx_stats_site_days_lookup", "stats_site_days",
+						"CREATE INDEX IF NOT EXISTS idx_stats_site_days_lookup ON stats_site_days (host_code, day)",
+					},
+					{
+						"idx_stats_site_hours_lookup", "stats_site_hours",
+						"CREATE INDEX IF NOT EXISTS idx_stats_site_hours_lookup ON stats_site_hours (host_code, hour_time)",
+					},
+				}
+				for _, idx := range siteIdxs {
+					if err := safeCreateIndex(tx, idx.table, idx.name, idx.sql); err != nil {
+						return fmt.Errorf("创建站点统计索引失败: %w", err)
+					}
+				}
+				zlog.Info("迁移 202603100001: 完成")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202603100001: 删除站点统计表")
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_stats_site_days_lookup").Error
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_stats_site_hours_lookup").Error
+				return tx.Migrator().DropTable(&model.StatsSiteDay{}, &model.StatsSiteHour{})
+			},
+		},
+		// 迁移4: 创建清理专用单列索引（性能关键，避免大表全表扫描）
+		{
+			ID: "202604100001_create_cleanup_indexes",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202604100001: 创建stats清理专用单列索引（大表建索引耗时属正常，请耐心等待）")
+
+				// DDL 建索引需要全表扫描，耗时与表数据量成正比，这里使用静默 logger
+				// 避免 GORM 慢查询阈值把正常的 DDL 误报为 SLOW SQL
+				ddlDB := tx.Session(&gorm.Session{
+					Logger: NewGormZLogger().LogMode(logger.Silent),
+				})
+
+				indexes := []struct {
+					name  string
+					table string
+					sql   string
+				}{
+					{"idx_stats_ip_days_day", "stats_ip_days", "CREATE INDEX IF NOT EXISTS idx_stats_ip_days_day ON stats_ip_days(day)"},
+					{"idx_stats_ip_city_days_day", "stats_ip_city_days", "CREATE INDEX IF NOT EXISTS idx_stats_ip_city_days_day ON stats_ip_city_days(day)"},
+					{"idx_ip_tags_create_time", "ip_tags", "CREATE INDEX IF NOT EXISTS idx_ip_tags_create_time ON ip_tags(create_time)"},
+					{"idx_ip_tags_update_time", "ip_tags", "CREATE INDEX IF NOT EXISTS idx_ip_tags_update_time ON ip_tags(update_time)"},
+				}
+
+				for _, idx := range indexes {
+					zlog.Info("创建索引中...", "index", idx.name)
+					start := time.Now()
+					if err := safeCreateIndex(ddlDB, idx.table, idx.name, idx.sql); err != nil {
+						return fmt.Errorf("创建清理索引 %s 失败: %w", idx.name, err)
+					}
+					zlog.Info("索引创建完成", "index", idx.name, "耗时", time.Since(start).String())
+				}
+
+				zlog.Info("迁移 202604100001: 清理专用索引创建完成")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202604100001: 删除清理专用索引")
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_stats_ip_days_day").Error
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_stats_ip_city_days_day").Error
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_ip_tags_create_time").Error
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_ip_tags_update_time").Error
+				return nil
+			},
+		},
+		// 迁移5: 首页"较昨日同期"对比用的索引
+		{
+			ID: "202608200001_create_compare_indexes",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202608200001: 创建首页同期对比索引（大表建索引耗时属正常，请耐心等待）")
+
+				ddlDB := tx.Session(&gorm.Session{
+					Logger: NewGormZLogger().LogMode(logger.Silent),
+				})
+
+				indexes := []struct {
+					name  string
+					table string
+					sql   string
+				}{
+					// 同期去重IP：count(distinct ip) where day=? and type=? and create_time<?
+					// 四列顺序即过滤顺序，ip 放最后让它变成覆盖索引，避免回表
+					{"idx_stats_ip_days_day_type_ct", "stats_ip_days",
+						"CREATE INDEX IF NOT EXISTS idx_stats_ip_days_day_type_ct ON stats_ip_days (day, type, create_time, ip)"},
+					// 同期攻击/访问量：小时表只按 hour_time range 扫，原有索引以 host_code 打头用不上
+					{"idx_stats_site_hours_time", "stats_site_hours",
+						"CREATE INDEX IF NOT EXISTS idx_stats_site_hours_time ON stats_site_hours (hour_time)"},
+				}
+
+				for _, idx := range indexes {
+					zlog.Info("创建索引中...", "index", idx.name)
+					start := time.Now()
+					if err := safeCreateIndex(ddlDB, idx.table, idx.name, idx.sql); err != nil {
+						return fmt.Errorf("创建同期对比索引 %s 失败: %w", idx.name, err)
+					}
+					zlog.Info("索引创建完成", "index", idx.name, "耗时", time.Since(start).String())
+				}
+
+				zlog.Info("迁移 202608200001: 首页同期对比索引创建完成")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202608200001: 删除首页同期对比索引")
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_stats_ip_days_day_type_ct").Error
+				_ = tx.Exec("DROP INDEX IF EXISTS idx_stats_site_hours_time").Error
+				return nil
+			},
+		},
+		// 迁移6: 分析层天级汇总表（行为「谁」/ 目标「打哪」/ 手法「怎么打」三视角的地基）
+		{
+			ID: "202609190001_create_analysis_stats_tables",
+			Migrate: func(tx *gorm.DB) error {
+				zlog.Info("迁移 202609190001: 创建分析层汇总表")
+				if err := tx.AutoMigrate(
+					&model.StatsActorPathDay{},
+					&model.StatsActorUaDay{},
+					&model.StatsPathRuleDay{},
+				); err != nil {
+					return fmt.Errorf("创建分析层汇总表失败: %w", err)
+				}
+
+				ddlDB := tx.Session(&gorm.Session{
+					Logger: NewGormZLogger().LogMode(logger.Silent),
+				})
+				indexes := []struct{ name, table, sql string }{
+					// 唯一索引即 upsert 的冲突目标，列序与 analysisConflictCols 一致
+					{"uni_stats_actor_path_days", "stats_actor_path_days",
+						"CREATE UNIQUE INDEX IF NOT EXISTS uni_stats_actor_path_days ON stats_actor_path_days (user_code, tenant_id, host_code, day, actor_key, path_norm)"},
+					// 目标视角：按站点+天 GROUP BY path_norm
+					{"idx_stats_actor_path_days_path", "stats_actor_path_days",
+						"CREATE INDEX IF NOT EXISTS idx_stats_actor_path_days_path ON stats_actor_path_days (host_code, day, path_norm)"},
+					// 行为视角：按站点+天 GROUP BY actor_key
+					{"idx_stats_actor_path_days_actor", "stats_actor_path_days",
+						"CREATE INDEX IF NOT EXISTS idx_stats_actor_path_days_actor ON stats_actor_path_days (host_code, day, actor_key)"},
+					// 保留策略按天删
+					{"idx_stats_actor_path_days_day", "stats_actor_path_days",
+						"CREATE INDEX IF NOT EXISTS idx_stats_actor_path_days_day ON stats_actor_path_days (day)"},
+
+					{"uni_stats_actor_ua_days", "stats_actor_ua_days",
+						"CREATE UNIQUE INDEX IF NOT EXISTS uni_stats_actor_ua_days ON stats_actor_ua_days (user_code, tenant_id, host_code, day, actor_key, ua_hash)"},
+					{"idx_stats_actor_ua_days_day", "stats_actor_ua_days",
+						"CREATE INDEX IF NOT EXISTS idx_stats_actor_ua_days_day ON stats_actor_ua_days (day)"},
+
+					{"uni_stats_path_rule_days", "stats_path_rule_days",
+						"CREATE UNIQUE INDEX IF NOT EXISTS uni_stats_path_rule_days ON stats_path_rule_days (user_code, tenant_id, host_code, day, path_norm, rule)"},
+					{"idx_stats_path_rule_days_day", "stats_path_rule_days",
+						"CREATE INDEX IF NOT EXISTS idx_stats_path_rule_days_day ON stats_path_rule_days (day)"},
+				}
+				for _, idx := range indexes {
+					if err := safeCreateIndex(ddlDB, idx.table, idx.name, idx.sql); err != nil {
+						return fmt.Errorf("创建分析层索引 %s 失败: %w", idx.name, err)
+					}
+				}
+				zlog.Info("迁移 202609190001: 分析层汇总表与索引创建完成")
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				zlog.Info("回滚 202609190001: 删除分析层汇总表")
+				for _, name := range []string{
+					"uni_stats_actor_path_days", "idx_stats_actor_path_days_path",
+					"idx_stats_actor_path_days_actor", "idx_stats_actor_path_days_day",
+					"uni_stats_actor_ua_days", "idx_stats_actor_ua_days_day",
+					"uni_stats_path_rule_days", "idx_stats_path_rule_days_day",
+				} {
+					_ = tx.Exec("DROP INDEX IF EXISTS " + name).Error
+				}
+				return tx.Migrator().DropTable(
+					&model.StatsActorPathDay{},
+					&model.StatsActorUaDay{},
+					&model.StatsPathRuleDay{},
+				)
+			},
+		},
+	})
+
+	// 执行迁移
+	if err := m.Migrate(); err != nil {
+		errMsg := fmt.Sprintf("stats数据库迁移失败: %v", err)
+		zlog.Error("迁移执行错误", "error", err.Error())
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	zlog.Info("stats数据库迁移成功完成")
+	return nil
+}
+
+// checkStatsTablesExist 检查所有stats表是否存在
+func checkStatsTablesExist(db *gorm.DB) bool {
+	tables := []interface{}{
+		&model.StatsTotal{},
+		&model.StatsDay{},
+		&model.StatsIPDay{},
+		&model.StatsIPCityDay{},
+		&model.IPTag{},
+	}
+
+	for _, table := range tables {
+		if !db.Migrator().HasTable(table) {
+			return false
+		}
+	}
+	return true
+}
+
+// checkStatsIndexesExist 检查所有stats索引是否存在
+func checkStatsIndexesExist(db *gorm.DB) bool {
+	// 需要检查的索引列表（表名, 索引名）
+	indexes := []struct {
+		TableName string
+		IndexName string
+	}{
+		{"stats_days", "idx_stats_days_lookup"},
+		{"stats_ip_days", "idx_stats_ip_days_lookup"},
+		{"stats_ip_city_days", "idx_stats_ip_city_days_lookup"},
+		{"ip_tags", "uni_iptags_full"},
+		{"ip_tags", "idx_iptag_ip"},
+	}
+
+	for _, idx := range indexes {
+		if !checkIndexExists(db, idx.TableName, idx.IndexName) {
+			zlog.Info("索引不存在", "table", idx.TableName, "index", idx.IndexName)
+			return false
+		}
+	}
+	return true
+}
+
+// createStatsIndexes 创建所有stats索引（幂等操作）
+func createStatsIndexes(tx *gorm.DB) error {
+	zlog.Info("开始创建stats索引（可能需要几分钟）...")
+	startTime := time.Now()
+
+	// 先检查并清理 ip_tags 表中的重复数据（针对唯一索引）
+	if err := cleanupDuplicateIPTagsInStats(tx); err != nil {
+		zlog.Warn("清理重复数据时出现问题", "error", err.Error())
+	}
+
+	indexes := []struct {
+		Table string
+		Name  string
+		SQL   string
+	}{
+		{
+			Table: "stats_days",
+			Name:  "idx_stats_days_lookup",
+			SQL:   "CREATE INDEX IF NOT EXISTS idx_stats_days_lookup ON stats_days (tenant_id, user_code, host_code, type, day)",
+		},
+		{
+			Table: "stats_ip_days",
+			Name:  "idx_stats_ip_days_lookup",
+			SQL:   "CREATE INDEX IF NOT EXISTS idx_stats_ip_days_lookup ON stats_ip_days (tenant_id, user_code, host_code, ip, type, day)",
+		},
+		{
+			Table: "stats_ip_city_days",
+			Name:  "idx_stats_ip_city_days_lookup",
+			SQL:   "CREATE INDEX IF NOT EXISTS idx_stats_ip_city_days_lookup ON stats_ip_city_days (tenant_id, user_code, host_code, country, province, city, type, day)",
+		},
+		{
+			Table: "ip_tags",
+			Name:  "uni_iptags_full",
+			SQL:   "CREATE UNIQUE INDEX IF NOT EXISTS uni_iptags_full ON ip_tags (user_code, tenant_id, ip, ip_tag)",
+		},
+		{
+			Table: "ip_tags",
+			Name:  "idx_iptag_ip",
+			SQL:   "CREATE INDEX IF NOT EXISTS idx_iptag_ip ON ip_tags (user_code, tenant_id, ip)",
+		},
+	}
+
+	for _, idx := range indexes {
+		zlog.Info("开始创建索引", "index", idx.Name, "sql", idx.SQL)
+		indexStartTime := time.Now()
+
+		if err := safeCreateIndex(tx, idx.Table, idx.Name, idx.SQL); err != nil {
+			errMsg := fmt.Sprintf("创建索引失败 %s: %v (错误类型: %T)", idx.Name, err, err)
+			zlog.Error("索引创建失败详情", "index", idx.Name, "error", err.Error(), "sql", idx.SQL)
+			return fmt.Errorf("%s", errMsg)
+		}
+
+		indexDuration := time.Since(indexStartTime)
+		zlog.Info("索引创建成功", "index", idx.Name, "耗时", indexDuration.String())
+	}
+
+	duration := time.Since(startTime)
+	zlog.Info("所有stats索引创建完成", "耗时", duration.String())
+	return nil
+}
+
+// cleanupDuplicateIPTagsInStats 清理 ip_tags 表中的重复数据（stats数据库）
+func cleanupDuplicateIPTagsInStats(tx *gorm.DB) error {
+	zlog.Info("检查 ip_tags 表中的重复数据...")
+
+	// 检查是否存在重复数据
+	var duplicateCount int64
+	// HAVING 必须写 COUNT(*) 而不是 SELECT 里的别名 cnt：
+	// SQLite/MySQL 容忍在 HAVING 中引用 SELECT 别名，PostgreSQL 不允许。
+	err := tx.Raw(`
+		SELECT COUNT(*) FROM (
+			SELECT user_code, tenant_id, ip, ip_tag, COUNT(*) as cnt
+			FROM ip_tags
+			GROUP BY user_code, tenant_id, ip, ip_tag
+			HAVING COUNT(*) > 1
+		) AS t
+	`).Scan(&duplicateCount).Error
+
+	if err != nil {
+		return fmt.Errorf("检查重复数据失败: %w", err)
+	}
+
+	if duplicateCount == 0 {
+		zlog.Info("ip_tags 表无重复数据，可以安全创建唯一索引")
+		return nil
+	}
+
+	zlog.Warn("发现重复数据，开始清理", "重复组数", duplicateCount)
+
+	// 删除重复数据，保留 id 最小的记录
+	result := tx.Exec(`
+		DELETE FROM ip_tags
+		WHERE id NOT IN (
+			SELECT MIN(id)
+			FROM ip_tags
+			GROUP BY user_code, tenant_id, ip, ip_tag
+		)
+	`)
+
+	if result.Error != nil {
+		return fmt.Errorf("清理重复数据失败: %w", result.Error)
+	}
+
+	zlog.Info("重复数据清理完成", "删除记录数", result.RowsAffected)
+	return nil
+}
+
+// dropStatsIndexes 删除所有stats索引
+func dropStatsIndexes(tx *gorm.DB) error {
+	zlog.Info("开始删除stats索引")
+
+	indexes := []struct{ table, name string }{
+		{"stats_days", "idx_stats_days_lookup"},
+		{"stats_ip_days", "idx_stats_ip_days_lookup"},
+		{"stats_ip_city_days", "idx_stats_ip_city_days_lookup"},
+		{"ip_tags", "uni_iptags_full"},
+		{"ip_tags", "idx_iptag_ip"},
+	}
+
+	for _, idx := range indexes {
+		if err := safeDropIndex(tx, idx.table, idx.name); err != nil {
+			zlog.Warn("删除索引失败（可能不存在）", "index", idx.name, "error", err)
+		} else {
+			zlog.Info("索引删除成功", "index", idx.name)
+		}
+	}
+
+	zlog.Info("所有stats索引删除完成")
+	return nil
+}
+
+// RollbackStatsDBMigration 回滚到指定版本
+func RollbackStatsDBMigration(db *gorm.DB, migrationID string) error {
+	zlog.Info("准备回滚stats迁移", "target_version", migrationID)
+
+	m := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{})
+	if err := m.RollbackTo(migrationID); err != nil {
+		return fmt.Errorf("回滚失败: %w", err)
+	}
+
+	zlog.Info("回滚成功完成", "version", migrationID)
+	return nil
+}

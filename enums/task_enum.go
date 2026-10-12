@@ -1,0 +1,33 @@
+package enums
+
+const (
+	TASK_RUNTIME_QPS_CLEAN            = "task_runtime_qps_clean"            //清空运行QPS
+	TASK_HOST_QPS_CLEAN               = "task_host_qps_clean"               //清空主机QPS
+	TASK_SHARE_DB                     = "task_share_db"                     //分区检测(每天兜底)
+	TASK_SHARE_DB_CHECK               = "task_share_db_check"               //分区高频检测(每5分钟；按周期切，体积超限兜底)
+	TASK_COUNTER                      = "task_counter"                      //统计
+	TASK_DELAY_INFO                   = "task_delay_info"                   //延迟统计信息
+	TASK_LOAD_CONFIG                  = "task_load_config"                  //获取配置信息
+	TASK_REFLUSH_WECHAT_ACCESS_TOKEN  = "task_reflush_wechat_access_token"  //刷新微信端accesstoken
+	TASK_DELETE_HISTORY_INFO          = "task_delete_history_info"          //删除历史信息
+	TASK_DELETE_HISTORY_DOWNLOAD_FILE = "task_delete_history_download_file" //删除历史文件信息
+	TASK_SSL_ORDER_RENEW              = "task_ssl_order_renew"              //SSL 证书自动续期
+	TASK_SSL_PATH_LOAD                = "task_ssl_path_load"                //SSL证书可自动加载路径下的证书
+	TASK_BATCH                        = "task_batch"                        //批量任务
+	TASK_SSL_EXPIRE_CHECK             = "task_ssl_expire_check"             //SSL证书到期检测
+	TASK_MANAGER_CERT_CHECK           = "task_manager_cert_check"           //管理端证书到期检测与本地证书自动续期
+	TASK_NOTICE                       = "task_notice"                       //通知信息
+	TASK_HEALTH                       = "task_health"                       //健康检测
+	TASK_CLEAR_CC_WINDOWS             = "task_clear_cc_windows"             //清除ccWindows记录
+	TASK_CLEAR_WEBCACHE               = "task_clear_webcache"               //清除缓存
+	TASK_GC                           = "task_gc"                           //GC回收
+	TASK_STATS_PUSH                   = "task_stats_push"                   //系统统计数据推送
+	TASK_DB_MONITOR                   = "task_db_monitor"                   //数据库监控
+	TASK_FIREWALL_CLEAN_EXPIRED       = "task_firewall_clean_expired"       //清理过期防火墙IP封禁规则
+	TASK_STATS_DATA_CLEANUP           = "task_stats_data_cleanup"           //清理统计数据（按保留策略）
+	TASK_THREAT_IP_SYNC               = "task_threat_ip_sync"               //威胁情报IP订阅同步
+	TASK_ACCESS_CLEAN                 = "task_access_clean"                 //统一访问认证：清理过期会话/令牌/票据与审计日志
+	TASK_HTTPAUTH_CLEAN               = "task_httpauth_clean"               //网站密码访问：标记到期会话并清理历史行
+	TASK_HOSTGUARD_CLEAN_EXPIRED      = "task_hostguard_clean_expired"      //主机防爆破：解封到期封禁(每分钟，因最短阶梯只有5分钟)
+	TASK_TRAFFIC_FLUSH                = "task_traffic_flush"                //站点流量计量落库(30秒一次，引擎侧字节计量与日志解耦)
+)
